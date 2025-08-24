@@ -1,0 +1,506 @@
+from vllm import LLM, SamplingParams
+import json
+import time
+import os
+import subprocess
+import sys
+from typing import List, Dict, Any, Optional
+import logging
+from datasets import load_dataset
+import numpy as np
+import bz2
+import tarfile
+import requests
+from urllib.parse import urljoin
+
+# Setup logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+class SelfRAGModel:
+    """Complete Self-RAG model implementation following the original README"""
+    
+    def __init__(self, 
+                 model_path: str = "selfrag/selfrag_llama2_7b",
+                 download_dir: str = "/gscratch/h2lab/akari/model_cache",
+                 dtype: str = "half"):
+        """Initialize Self-RAG model exactly as in README"""
+        self.model = LLM(model_path, download_dir=download_dir, dtype=dtype)
+        self.sampling_params = SamplingParams(temperature=0.0, top_p=1.0, max_tokens=100, skip_special_tokens=False)
+
+    def format_prompt(self, input, paragraph=None):
+        """Format prompt exactly as in README"""
+        prompt = "### Instruction:\n{0}\n\n### Response:\n".format(input)
+        if paragraph is not None:
+            prompt += "[Retrieval]<paragraph>{0}</paragraph>".format(paragraph)
+        return prompt
+
+    def extract_utility_score(self, text: str) -> int:
+        """Extract utility score from Self-RAG output"""
+        for i in range(5, 0, -1):
+            if f'[Utility:{i}]' in text:
+                return i
+        return 0
+
+def benchmark_selfrag(model, queries: List[str], contexts: List[str] = None) -> List[Dict[str, Any]]:
+    """
+    Original benchmark function from the provided code
+    
+    Args:
+        model: SelfRAG model instance
+        queries: List of input queries
+        contexts: Optional retrieved contexts (if None, runs without retrieval)
+    
+    Returns:
+        List of results with timing and response data
+    """
+    results = []
+    
+    if contexts is None:
+        # No retrieval mode
+        prompts = [model.format_prompt(query) for query in queries]
+        
+        start_time = time.time()
+        preds = model.model.generate(prompts, model.sampling_params)
+        inference_time = time.time() - start_time
+        
+        for i, (query, pred) in enumerate(zip(queries, preds)):
+            results.append({
+                'query': query,
+                'response': pred.outputs[0].text,
+                'mode': 'no_retrieval',
+                'inference_time': inference_time / len(queries),
+                'tokens_generated': len(pred.outputs[0].token_ids),
+                'retrieval_used': '[Retrieve]' in pred.outputs[0].text
+            })
+    else:
+        # With retrieval mode
+        prompts = [model.format_prompt(query, context) for query, context in zip(queries, contexts)]
+        
+        start_time = time.time()
+        preds = model.model.generate(prompts, model.sampling_params)
+        inference_time = time.time() - start_time
+        
+        for i, (query, context, pred) in enumerate(zip(queries, contexts, preds)):
+            response_text = pred.outputs[0].text
+            results.append({
+                'query': query,
+                'context': context,
+                'response': response_text,
+                'mode': 'with_retrieval',
+                'inference_time': inference_time / len(queries),
+                'tokens_generated': len(pred.outputs[0].token_ids),
+                'is_relevant': '[Relevant]' in response_text,
+                'is_supported': '[Fully supported]' in response_text or '[Partially supported]' in response_text,
+                'utility_score': model.extract_utility_score(response_text)
+            })
+    
+    return results
+
+def download_crag_data():
+    """Download CRAG data following the official documentation"""
+    data_dir = "crag_data"
+    os.makedirs(data_dir, exist_ok=True)
+    
+    # CRAG data URLs from the documentation
+    crag_urls = {
+        "task_1_and_2": "https://github.com/facebookresearch/CRAG/raw/refs/heads/main/data/crag_task_1_and_2_dev_v4.jsonl.bz2",
+        "task_3_part1": "https://github.com/facebookresearch/CRAG/raw/refs/heads/main/data/crag_task_3_dev_v4.tar.bz2.part1",
+        "task_3_part2": "https://github.com/facebookresearch/CRAG/raw/refs/heads/main/data/crag_task_3_dev_v4.tar.bz2.part2", 
+        "task_3_part3": "https://github.com/facebookresearch/CRAG/raw/refs/heads/main/data/crag_task_3_dev_v4.tar.bz2.part3",
+        "task_3_part4": "https://github.com/facebookresearch/CRAG/raw/refs/heads/main/data/crag_task_3_dev_v4.tar.bz2.part4"
+    }
+    
+    # Download Task 1 and 2 data
+    task_1_2_file = os.path.join(data_dir, "crag_task_1_and_2_dev_v4.jsonl.bz2")
+    if not os.path.exists(task_1_2_file):
+        logger.info("Downloading CRAG Task 1 and 2 data...")
+        try:
+            response = requests.get(crag_urls["task_1_and_2"], stream=True)
+            response.raise_for_status()
+            with open(task_1_2_file, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            logger.info("CRAG Task 1 and 2 data downloaded successfully")
+        except Exception as e:
+            logger.error(f"Failed to download CRAG Task 1 and 2 data: {e}")
+            return None
+    
+    return data_dir
+
+def load_crag_data(data_dir: str, task: str = "1_and_2", sample_size: int = 100):
+    """Load CRAG data from downloaded files following the official documentation"""
+    
+    if task == "1_and_2":
+        file_path = os.path.join(data_dir, "crag_task_1_and_2_dev_v4.jsonl.bz2")
+        
+        if not os.path.exists(file_path):
+            logger.error(f"CRAG data file not found: {file_path}")
+            return None
+        
+        try:
+            logger.info(f"Loading CRAG Task {task} data from {file_path}")
+            data = []
+            
+            with bz2.open(file_path, 'rt', encoding='utf-8') as f:
+                for i, line in enumerate(f):
+                    if i >= sample_size:
+                        break
+                    try:
+                        item = json.loads(line.strip())
+                        data.append(item)
+                    except json.JSONDecodeError as e:
+                        logger.warning(f"Skipping invalid JSON line {i}: {e}")
+                        continue
+            
+            logger.info(f"Loaded {len(data)} CRAG samples")
+            return data
+            
+        except Exception as e:
+            logger.error(f"Error loading CRAG data: {e}")
+            return None
+    
+    else:
+        logger.error(f"Task {task} not implemented yet. Only '1_and_2' is currently supported.")
+        return None
+
+def run_crag_benchmark(model, task: str = "1_and_2", sample_size: int = 100):
+    """
+    CRAG Benchmark Implementation following official documentation
+    
+    Args:
+        model: SelfRAG model instance
+        task: CRAG task ("1_and_2" or "3")
+        sample_size: Number of samples to evaluate
+    """
+    logger.info(f"Setting up CRAG Task {task} benchmark...")
+    
+    # Download CRAG data
+    data_dir = download_crag_data()
+    if data_dir is None:
+        logger.error("Failed to download CRAG data")
+        return []
+    
+    # Load CRAG data
+    crag_data = load_crag_data(data_dir, task, sample_size)
+    if crag_data is None:
+        logger.error("Failed to load CRAG dataset")
+        return []
+    
+    logger.info(f"Running CRAG Task {task} benchmark with {len(crag_data)} samples...")
+    
+    crag_results = []
+    for i, item in enumerate(crag_data):
+        try:
+            # Extract data following CRAG schema
+            interaction_id = item.get('interaction_id', f'crag_{i}')
+            query = item.get('query', '')
+            answer = item.get('answer', '')
+            alt_ans = item.get('alt_ans', [])
+            domain = item.get('domain', 'unknown')
+            question_type = item.get('question_type', 'unknown')
+            search_results = item.get('search_results', [])
+            
+            # For Task 1 & 2: use first 5 search results (as per documentation)
+            context = None
+            if search_results and task == "1_and_2":
+                # Use page snippets as context (5 pages randomly selected from top-10)
+                contexts = []
+                for result in search_results[:5]:  # Take first 5 as they're already randomly selected
+                    page_snippet = result.get('page_snippet', '')
+                    page_name = result.get('page_name', '')
+                    if page_snippet:
+                        contexts.append(f"{page_name}: {page_snippet}")
+                
+                if contexts:
+                    context = "\n".join(contexts)
+            
+            # Generate Self-RAG response
+            if context:
+                prompt = model.format_prompt(query, context)
+            else:
+                prompt = model.format_prompt(query)
+            
+            start_time = time.time()
+            pred = model.model.generate([prompt], model.sampling_params)[0]
+            inference_time = time.time() - start_time
+            
+            response_text = pred.outputs[0].text
+            
+            # CRAG evaluation - exact match with answer or alternative answers
+            exact_match = False
+            if answer:
+                exact_match = answer.lower().strip() in response_text.lower()
+            
+            # Check alternative answers
+            if not exact_match and alt_ans:
+                for alt in alt_ans:
+                    if alt and alt.lower().strip() in response_text.lower():
+                        exact_match = True
+                        break
+            
+            crag_results.append({
+                'interaction_id': interaction_id,
+                'query': query,
+                'context': context,
+                'response': response_text,
+                'ground_truth': answer,
+                'alt_answers': alt_ans,
+                'domain': domain,
+                'question_type': question_type,
+                'exact_match': exact_match,
+                'inference_time': inference_time,
+                'tokens_generated': len(pred.outputs[0].token_ids),
+                'is_relevant': '[Relevant]' in response_text,
+                'is_supported': '[Fully supported]' in response_text or '[Partially supported]' in response_text,
+                'utility_score': model.extract_utility_score(response_text),
+                'num_search_results': len(search_results)
+            })
+            
+            if (i + 1) % 10 == 0:
+                logger.info(f"Processed {i + 1}/{len(crag_data)} CRAG samples")
+            
+        except Exception as e:
+            logger.error(f"Error processing CRAG item {i}: {e}")
+            continue
+    
+    if crag_results:
+        avg_exact_match = np.mean([r['exact_match'] for r in crag_results])
+        avg_utility = np.mean([r['utility_score'] for r in crag_results])
+        relevance_rate = np.mean([r['is_relevant'] for r in crag_results])
+        support_rate = np.mean([r['is_supported'] for r in crag_results])
+        
+        logger.info(f"CRAG Task {task} benchmark completed:")
+        logger.info(f"  Exact Match: {avg_exact_match:.3f}")
+        logger.info(f"  Average Utility: {avg_utility:.3f}")
+        logger.info(f"  Relevance Rate: {relevance_rate:.3f}")
+        logger.info(f"  Support Rate: {support_rate:.3f}")
+    
+    return crag_results
+
+def run_ragbench_benchmark(model, dataset_name: str = "covidqa", sample_size: int = 100):
+    """
+    RAGBench Implementation using HuggingFace datasets
+    Supports: covidqa, cuad, delucionqa
+    """
+    logger.info(f"Running RAGBench benchmark on {dataset_name} with {sample_size} samples...")
+    
+    try:
+        # Load RAGBench dataset with error handling for different dataset structures
+        dataset_path = f"galileo-ai/ragbench"
+        
+        # Try loading the dataset with the specific subset
+        try:
+            ds = load_dataset(dataset_path, dataset_name)
+        except:
+            # If that fails, try without the subset name
+            logger.info(f"Trying to load {dataset_path} without subset...")
+            ds = load_dataset(dataset_path)
+        
+        # Determine which split to use
+        available_splits = list(ds.keys())
+        logger.info(f"Available splits: {available_splits}")
+        
+        if 'test' in available_splits:
+            dataset = ds['test']
+        elif 'validation' in available_splits:
+            dataset = ds['validation']
+        elif 'train' in available_splits:
+            dataset = ds['train']
+        else:
+            # If no standard splits, use the first available
+            dataset = ds[available_splits[0]]
+        
+        # Take sample
+        if sample_size < len(dataset):
+            dataset = dataset.select(range(sample_size))
+        
+        logger.info(f"Using {len(dataset)} samples from RAGBench {dataset_name}")
+        
+        ragbench_results = []
+        
+        for i, item in enumerate(dataset):
+            try:
+                # Handle different possible field names
+                query = item.get('question', item.get('query', item.get('input', f"Question {i+1}")))
+                context = item.get('context', item.get('passage', item.get('document', None)))
+                ground_truth = item.get('answer', item.get('target', item.get('ground_truth', 'Unknown')))
+                
+                # Generate Self-RAG response
+                if context and context.strip():
+                    prompt = model.format_prompt(query, context)
+                else:
+                    prompt = model.format_prompt(query)
+                
+                start_time = time.time()
+                pred = model.model.generate([prompt], model.sampling_params)[0]
+                inference_time = time.time() - start_time
+                
+                response_text = pred.outputs[0].text
+                
+                # RAGBench metrics
+                exact_match = ground_truth.lower().strip() in response_text.lower() if ground_truth and ground_truth != 'Unknown' else False
+                
+                ragbench_results.append({
+                    'dataset': dataset_name,
+                    'query': query,
+                    'context': context,
+                    'response': response_text,
+                    'ground_truth': ground_truth,
+                    'exact_match': exact_match,
+                    'inference_time': inference_time,
+                    'tokens_generated': len(pred.outputs[0].token_ids),
+                    'is_relevant': '[Relevant]' in response_text,
+                    'is_supported': '[Fully supported]' in response_text or '[Partially supported]' in response_text,
+                    'utility_score': model.extract_utility_score(response_text)
+                })
+                
+            except Exception as e:
+                logger.error(f"Error processing RAGBench item {i}: {e}")
+                continue
+        
+        if ragbench_results:
+            avg_em = np.mean([r['exact_match'] for r in ragbench_results])
+            logger.info(f"RAGBench {dataset_name} completed. Exact Match: {avg_em:.3f}")
+        
+        return ragbench_results
+        
+    except Exception as e:
+        logger.error(f"Error running RAGBench {dataset_name}: {e}")
+        logger.info("Please ensure you have access to the dataset. You may need: huggingface-cli login")
+        return []
+
+def run_all_ragbench_datasets(model, sample_size: int = 100):
+    """Run all available RAGBench datasets"""
+    all_results = {}
+    
+    # Try different possible dataset names
+    possible_datasets = ["covidqa", "cuad", "delucionqa"]
+    
+    # First, try to discover what datasets are actually available
+    try:
+        logger.info("Discovering available RAGBench datasets...")
+        # This would need to be adapted based on the actual RAGBench structure
+        ds_info = load_dataset("galileo-ai/ragbench", split="train", streaming=True)
+        logger.info(f"RAGBench dataset loaded successfully")
+    except Exception as e:
+        logger.warning(f"Could not load RAGBench info: {e}")
+    
+    for dataset_name in possible_datasets:
+        logger.info(f"Attempting to run {dataset_name}...")
+        results = run_ragbench_benchmark(model, dataset_name, sample_size)
+        if results:  # Only add if we got results
+            all_results[dataset_name] = results
+        else:
+            logger.warning(f"No results obtained for {dataset_name}")
+    
+    return all_results
+
+def main():
+    """Main function to run Self-RAG benchmarks"""
+    print("Initializing Self-RAG Model...")
+    
+    # Initialize model exactly as in README
+    try:
+        model = SelfRAGModel()
+        print("Self-RAG Model loaded successfully!")
+    except Exception as e:
+        print(f"Error loading model: {e}")
+        print("Please ensure vLLM and the model are properly installed")
+        return
+    
+    # Original benchmark from the provided code
+    print("\n" + "="*50)
+    print("RUNNING ORIGINAL SELF-RAG BENCHMARK")
+    print("="*50)
+    
+    test_queries = [
+        "Leave odd one out: twitter, instagram, whatsapp.",
+        "Can you tell me the difference between llamas and alpacas?",
+        "What is the capital of France?",
+        "Explain quantum computing."
+    ]
+    
+    print("\n=== NO RETRIEVAL BENCHMARK ===")
+    no_retrieval_results = benchmark_selfrag(model, test_queries)
+    for result in no_retrieval_results:
+        print(f"Query: {result['query']}")
+        print(f"Response: {result['response']}")
+        print(f"Retrieval triggered: {result['retrieval_used']}")
+        print(f"Inference time: {result['inference_time']:.3f}s")
+        print("-" * 50)
+    
+    print("\n=== WITH RETRIEVAL BENCHMARK ===")
+    contexts = [
+        "Social media platforms for sharing content.",
+        "The alpaca (Lama pacos) is a species of South American camelid mammal. It is similar to, and often confused with, the llama. Alpacas are considerably smaller than llamas, and unlike llamas, they were not bred to be working animals, but were bred specifically for their fiber.",
+        "Paris is the capital and most populous city of France.",
+        "Quantum computing is a type of computation that harnesses quantum mechanics to process information in ways that classical computers cannot."
+    ]
+    
+    with_retrieval_results = benchmark_selfrag(model, test_queries, contexts)
+    for result in with_retrieval_results:
+        print(f"Query: {result['query']}")
+        print(f"Response: {result['response']}")
+        print(f"Relevant: {result['is_relevant']}")
+        print(f"Supported: {result['is_supported']}")
+        print(f"Utility: {result['utility_score']}")
+        print(f"Inference time: {result['inference_time']:.3f}s")
+        print("-" * 50)
+    
+    # Save original benchmark results
+    original_results = {
+        'no_retrieval': no_retrieval_results,
+        'with_retrieval': with_retrieval_results
+    }
+    
+    # Menu for additional benchmarks
+    print("\n" + "="*50)
+    print("ADDITIONAL BENCHMARKS AVAILABLE")
+    print("="*50)
+    print("1. CRAG Benchmark (Task 1 & 2)")
+    print("2. RAGBench - CovidQA")
+    print("3. RAGBench - CUAD") 
+    print("4. RAGBench - DelucionQA")
+    print("5. All RAGBench datasets")
+    print("6. Skip additional benchmarks")
+    
+    choice = input("Select additional benchmark (1-6, default 6): ").strip() or "6"
+    
+    additional_results = {}
+    
+    if choice == "1":
+        sample_size = int(input("CRAG sample size (default 100): ") or "100")
+        additional_results['crag'] = run_crag_benchmark(model, "1_and_2", sample_size)
+    elif choice == "2":
+        sample_size = int(input("RAGBench CovidQA sample size (default 100): ") or "100")
+        additional_results['ragbench_covidqa'] = run_ragbench_benchmark(model, "covidqa", sample_size)
+    elif choice == "3":
+        sample_size = int(input("RAGBench CUAD sample size (default 100): ") or "100")
+        additional_results['ragbench_cuad'] = run_ragbench_benchmark(model, "cuad", sample_size)
+    elif choice == "4":
+        sample_size = int(input("RAGBench DelucionQA sample size (default 100): ") or "100")
+        additional_results['ragbench_delucionqa'] = run_ragbench_benchmark(model, "delucionqa", sample_size)
+    elif choice == "5":
+        sample_size = int(input("RAGBench sample size per dataset (default 100): ") or "100")
+        additional_results['ragbench_all'] = run_all_ragbench_datasets(model, sample_size)
+    
+    # Combine all results
+    all_results = {
+        'original_benchmark': original_results,
+        **additional_results
+    }
+    
+    # Save results
+    output_file = 'selfrag_benchmark_results.json'
+    try:
+        with open(output_file, 'w') as f:
+            json.dump(all_results, f, indent=2, default=str)
+        print(f"\nBenchmark results saved to '{output_file}'")
+    except Exception as e:
+        print(f"Error saving results: {e}")
+    
+    print("Benchmark completed successfully!")
+
+if __name__ == "__main__":
+    main()
