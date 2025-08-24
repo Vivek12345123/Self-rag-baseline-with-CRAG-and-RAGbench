@@ -12,6 +12,7 @@ import bz2
 import tarfile
 import requests
 from urllib.parse import urljoin
+import kagglehub
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -396,6 +397,247 @@ def run_all_ragbench_datasets(model, sample_size: int = 100):
     
     return all_results
 
+def download_squad_data():
+    """Download SQuAD dataset using kagglehub"""
+    logger.info("Downloading SQuAD dataset...")
+    try:
+        # Download latest version
+        path = kagglehub.dataset_download("stanfordu/stanford-question-answering-dataset")
+        logger.info(f"Path to SQuAD dataset files: {path}")
+        return path
+    except Exception as e:
+        logger.error(f"Error downloading SQuAD dataset: {e}")
+        logger.info("Please ensure kagglehub is installed: pip install kagglehub")
+        return None
+
+def run_squad_v2_benchmark(model, sample_size: int = 100):
+    """
+    SQuAD v2 Benchmark Implementation using downloaded data
+    
+    Args:
+        model: SelfRAG model instance
+        sample_size: Number of samples to evaluate
+    """
+    logger.info(f"Running SQuAD v2 benchmark with {sample_size} samples...")
+    
+    # First try to download using kagglehub
+    data_path = download_squad_data()
+    
+    # Fallback to HuggingFace if kagglehub fails
+    if data_path is None:
+        logger.warning("Kagglehub download failed, trying HuggingFace datasets...")
+        try:
+            ds = load_dataset("squad_v2")
+            
+            # Use validation split for evaluation
+            if 'validation' in ds:
+                dataset = ds['validation']
+            else:
+                dataset = ds['train']
+            
+            # Take sample
+            if sample_size < len(dataset):
+                dataset = dataset.select(range(sample_size))
+            
+            logger.info(f"Using {len(dataset)} samples from SQuAD v2 via HuggingFace")
+            
+            squad_results = []
+            
+            for i, item in enumerate(dataset):
+                try:
+                    # Extract SQuAD v2 fields
+                    question = item.get('question', '')
+                    context = item.get('context', '')
+                    answers = item.get('answers', {})
+                    is_impossible = item.get('is_impossible', False)
+                    squad_id = item.get('id', f'squad_{i}')
+                    
+                    # Get answer texts
+                    answer_texts = answers.get('text', []) if answers else []
+                    
+                    # Generate Self-RAG response
+                    if context.strip():
+                        prompt = model.format_prompt(question, context)
+                    else:
+                        prompt = model.format_prompt(question)
+                    
+                    start_time = time.time()
+                    pred = model.model.generate([prompt], model.sampling_params)[0]
+                    inference_time = time.time() - start_time
+                    
+                    response_text = pred.outputs[0].text
+                    
+                    # SQuAD v2 evaluation
+                    exact_match = False
+                    if not is_impossible and answer_texts:
+                        for ans_text in answer_texts:
+                            if ans_text and ans_text.lower().strip() in response_text.lower():
+                                exact_match = True
+                                break
+                    elif is_impossible:
+                        # For impossible questions, check if model indicates no answer
+                        no_answer_indicators = ["no answer", "cannot answer", "not provided", "unknown"]
+                        exact_match = any(indicator in response_text.lower() for indicator in no_answer_indicators)
+                    
+                    squad_results.append({
+                        'id': squad_id,
+                        'question': question,
+                        'context': context,
+                        'response': response_text,
+                        'ground_truth_answers': answer_texts,
+                        'is_impossible': is_impossible,
+                        'exact_match': exact_match,
+                        'inference_time': inference_time,
+                        'tokens_generated': len(pred.outputs[0].token_ids),
+                        'is_relevant': '[Relevant]' in response_text,
+                        'is_supported': '[Fully supported]' in response_text or '[Partially supported]' in response_text,
+                        'utility_score': model.extract_utility_score(response_text)
+                    })
+                    
+                    if (i + 1) % 10 == 0:
+                        logger.info(f"Processed {i + 1}/{len(dataset)} SQuAD v2 samples")
+                        
+                except Exception as e:
+                    logger.error(f"Error processing SQuAD v2 item {i}: {e}")
+                    continue
+            
+            if squad_results:
+                avg_em = np.mean([r['exact_match'] for r in squad_results])
+                avg_utility = np.mean([r['utility_score'] for r in squad_results])
+                relevance_rate = np.mean([r['is_relevant'] for r in squad_results])
+                support_rate = np.mean([r['is_supported'] for r in squad_results])
+                impossible_count = sum([r['is_impossible'] for r in squad_results])
+                
+                logger.info(f"SQuAD v2 benchmark completed:")
+                logger.info(f"  Exact Match: {avg_em:.3f}")
+                logger.info(f"  Average Utility: {avg_utility:.3f}")
+                logger.info(f"  Relevance Rate: {relevance_rate:.3f}")
+                logger.info(f"  Support Rate: {support_rate:.3f}")
+                logger.info(f"  Impossible Questions: {impossible_count}/{len(squad_results)}")
+            
+            return squad_results
+            
+        except Exception as e:
+            logger.error(f"Error loading SQuAD v2 from HuggingFace: {e}")
+            return []
+    
+    else:
+        # Process downloaded kagglehub data
+        logger.info(f"Processing SQuAD data from {data_path}")
+        
+        # Look for JSON files in the downloaded directory
+        import glob
+        json_files = glob.glob(os.path.join(data_path, "*.json"))
+        
+        if not json_files:
+            logger.error("No JSON files found in downloaded SQuAD data")
+            return []
+        
+        squad_results = []
+        processed_count = 0
+        
+        for json_file in json_files:
+            if processed_count >= sample_size:
+                break
+                
+            logger.info(f"Processing {json_file}")
+            
+            try:
+                with open(json_file, 'r', encoding='utf-8') as f:
+                    squad_data = json.load(f)
+                
+                # Navigate SQuAD JSON structure
+                for article in squad_data.get('data', []):
+                    if processed_count >= sample_size:
+                        break
+                        
+                    for paragraph in article.get('paragraphs', []):
+                        if processed_count >= sample_size:
+                            break
+                            
+                        context = paragraph.get('context', '')
+                        
+                        for qa in paragraph.get('qas', []):
+                            if processed_count >= sample_size:
+                                break
+                                
+                            try:
+                                question = qa.get('question', '')
+                                answers = qa.get('answers', [])
+                                is_impossible = qa.get('is_impossible', False)
+                                squad_id = qa.get('id', f'squad_{processed_count}')
+                                
+                                # Extract answer texts
+                                answer_texts = [ans.get('text', '') for ans in answers if ans.get('text')]
+                                
+                                # Generate Self-RAG response
+                                if context.strip():
+                                    prompt = model.format_prompt(question, context)
+                                else:
+                                    prompt = model.format_prompt(question)
+                                
+                                start_time = time.time()
+                                pred = model.model.generate([prompt], model.sampling_params)[0]
+                                inference_time = time.time() - start_time
+                                
+                                response_text = pred.outputs[0].text
+                                
+                                # SQuAD v2 evaluation
+                                exact_match = False
+                                if not is_impossible and answer_texts:
+                                    for ans_text in answer_texts:
+                                        if ans_text and ans_text.lower().strip() in response_text.lower():
+                                            exact_match = True
+                                            break
+                                elif is_impossible:
+                                    # For impossible questions, check if model indicates no answer
+                                    no_answer_indicators = ["no answer", "cannot answer", "not provided", "unknown"]
+                                    exact_match = any(indicator in response_text.lower() for indicator in no_answer_indicators)
+                                
+                                squad_results.append({
+                                    'id': squad_id,
+                                    'question': question,
+                                    'context': context,
+                                    'response': response_text,
+                                    'ground_truth_answers': answer_texts,
+                                    'is_impossible': is_impossible,
+                                    'exact_match': exact_match,
+                                    'inference_time': inference_time,
+                                    'tokens_generated': len(pred.outputs[0].token_ids),
+                                    'is_relevant': '[Relevant]' in response_text,
+                                    'is_supported': '[Fully supported]' in response_text or '[Partially supported]' in response_text,
+                                    'utility_score': model.extract_utility_score(response_text)
+                                })
+                                
+                                processed_count += 1
+                                
+                                if processed_count % 10 == 0:
+                                    logger.info(f"Processed {processed_count} SQuAD v2 samples")
+                                    
+                            except Exception as e:
+                                logger.error(f"Error processing SQuAD QA item: {e}")
+                                continue
+                                
+            except Exception as e:
+                logger.error(f"Error reading SQuAD JSON file {json_file}: {e}")
+                continue
+        
+        if squad_results:
+            avg_em = np.mean([r['exact_match'] for r in squad_results])
+            avg_utility = np.mean([r['utility_score'] for r in squad_results])
+            relevance_rate = np.mean([r['is_relevant'] for r in squad_results])
+            support_rate = np.mean([r['is_supported'] for r in squad_results])
+            impossible_count = sum([r['is_impossible'] for r in squad_results])
+            
+            logger.info(f"SQuAD v2 benchmark completed:")
+            logger.info(f"  Exact Match: {avg_em:.3f}")
+            logger.info(f"  Average Utility: {avg_utility:.3f}")
+            logger.info(f"  Relevance Rate: {relevance_rate:.3f}")
+            logger.info(f"  Support Rate: {support_rate:.3f}")
+            logger.info(f"  Impossible Questions: {impossible_count}/{len(squad_results)}")
+        
+        return squad_results
+
 def download_natural_questions_data():
     """Download Natural Questions data using gsutil"""
     data_dir = "natural_questions_data"
@@ -735,9 +977,10 @@ def main():
     print("7. HotpotQA - Distractor")
     print("8. HotpotQA - FullWiki")
     print("9. All HotpotQA variants")
-    print("10. Skip additional benchmarks")
+    print("10. SQuAD v2")
+    print("11. Skip additional benchmarks")
     
-    choice = input("Select additional benchmark (1-10, default 10): ").strip() or "10"
+    choice = input("Select additional benchmark (1-11, default 11): ").strip() or "11"
     
     additional_results = {}
     
@@ -768,6 +1011,9 @@ def main():
     elif choice == "9":
         sample_size = int(input("HotpotQA sample size per variant (default 100): ") or "100")
         additional_results['hotpot_all'] = run_all_hotpot_variants(model, sample_size)
+    elif choice == "10":
+        sample_size = int(input("SQuAD v2 sample size (default 100): ") or "100")
+        additional_results['squad_v2'] = run_squad_v2_benchmark(model, sample_size)
     
     # Combine all results
     all_results = {
