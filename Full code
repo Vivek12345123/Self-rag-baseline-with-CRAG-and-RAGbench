@@ -396,6 +396,274 @@ def run_all_ragbench_datasets(model, sample_size: int = 100):
     
     return all_results
 
+def download_natural_questions_data():
+    """Download Natural Questions data using gsutil"""
+    data_dir = "natural_questions_data"
+    os.makedirs(data_dir, exist_ok=True)
+    
+    logger.info("Downloading Natural Questions data...")
+    try:
+        # Check if gsutil is available
+        subprocess.run(["gsutil", "--version"], check=True, capture_output=True)
+        
+        # Download the data
+        cmd = ["gsutil", "-m", "cp", "-R", "gs://natural_questions/v1.0", data_dir]
+        result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+        
+        logger.info("Natural Questions data downloaded successfully")
+        return data_dir
+        
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Error downloading Natural Questions data: {e}")
+        logger.error(f"Please ensure gsutil is installed and configured")
+        return None
+    except FileNotFoundError:
+        logger.error("gsutil not found. Please install Google Cloud SDK")
+        return None
+
+def run_natural_questions_benchmark(model, sample_size: int = 100):
+    """
+    Natural Questions Benchmark Implementation
+    
+    Args:
+        model: SelfRAG model instance
+        sample_size: Number of samples to evaluate
+    """
+    logger.info(f"Running Natural Questions benchmark with {sample_size} samples...")
+    
+    # Try to download the data first
+    data_dir = download_natural_questions_data()
+    if data_dir is None:
+        logger.warning("Could not download Natural Questions data via gsutil, trying HuggingFace...")
+        
+        # Fallback to HuggingFace if available
+        try:
+            ds = load_dataset("natural_questions", split="train")
+            if sample_size < len(ds):
+                ds = ds.select(range(sample_size))
+            
+            logger.info(f"Using {len(ds)} samples from Natural Questions via HuggingFace")
+            
+            nq_results = []
+            
+            for i, item in enumerate(ds):
+                try:
+                    # Extract Natural Questions fields
+                    question_text = item.get('question', {}).get('text', '')
+                    document_html = item.get('document', {}).get('html', '')
+                    annotations = item.get('annotations', [])
+                    
+                    # Get short answers from annotations
+                    short_answers = []
+                    long_answers = []
+                    for annotation in annotations:
+                        if annotation.get('short_answers'):
+                            for sa in annotation['short_answers']:
+                                if sa.get('text'):
+                                    short_answers.append(sa['text'])
+                        if annotation.get('long_answer', {}).get('candidate_text'):
+                            long_answers.append(annotation['long_answer']['candidate_text'])
+                    
+                    # Use document HTML as context (truncated)
+                    context = document_html[:2000] if document_html else None  # Truncate for efficiency
+                    
+                    # Generate Self-RAG response
+                    if context:
+                        prompt = model.format_prompt(question_text, context)
+                    else:
+                        prompt = model.format_prompt(question_text)
+                    
+                    start_time = time.time()
+                    pred = model.model.generate([prompt], model.sampling_params)[0]
+                    inference_time = time.time() - start_time
+                    
+                    response_text = pred.outputs[0].text
+                    
+                    # Natural Questions evaluation - check if any short answer is in response
+                    exact_match = False
+                    if short_answers:
+                        for ans in short_answers:
+                            if ans and ans.lower().strip() in response_text.lower():
+                                exact_match = True
+                                break
+                    
+                    nq_results.append({
+                        'question': question_text,
+                        'context': context,
+                        'response': response_text,
+                        'short_answers': short_answers,
+                        'long_answers': long_answers,
+                        'exact_match': exact_match,
+                        'inference_time': inference_time,
+                        'tokens_generated': len(pred.outputs[0].token_ids),
+                        'is_relevant': '[Relevant]' in response_text,
+                        'is_supported': '[Fully supported]' in response_text or '[Partially supported]' in response_text,
+                        'utility_score': model.extract_utility_score(response_text)
+                    })
+                    
+                    if (i + 1) % 10 == 0:
+                        logger.info(f"Processed {i + 1}/{len(ds)} Natural Questions samples")
+                        
+                except Exception as e:
+                    logger.error(f"Error processing Natural Questions item {i}: {e}")
+                    continue
+            
+            if nq_results:
+                avg_em = np.mean([r['exact_match'] for r in nq_results])
+                avg_utility = np.mean([r['utility_score'] for r in nq_results])
+                relevance_rate = np.mean([r['is_relevant'] for r in nq_results])
+                support_rate = np.mean([r['is_supported'] for r in nq_results])
+                
+                logger.info(f"Natural Questions benchmark completed:")
+                logger.info(f"  Exact Match: {avg_em:.3f}")
+                logger.info(f"  Average Utility: {avg_utility:.3f}")
+                logger.info(f"  Relevance Rate: {relevance_rate:.3f}")
+                logger.info(f"  Support Rate: {support_rate:.3f}")
+            
+            return nq_results
+            
+        except Exception as e:
+            logger.error(f"Error loading Natural Questions from HuggingFace: {e}")
+            logger.info("Please ensure you have access to the dataset or gsutil configured")
+            return []
+    
+    # If gsutil download worked, process the downloaded files
+    # This would need additional implementation based on the actual file structure
+    logger.info("Processing downloaded Natural Questions files...")
+    # Implementation would depend on the actual file structure from gsutil
+    return []
+
+def run_hotpot_qa_benchmark(model, variant: str = "distractor", sample_size: int = 100):
+    """
+    HotpotQA Benchmark Implementation
+    
+    Args:
+        model: SelfRAG model instance
+        variant: HotpotQA variant ("distractor" or "fullwiki")
+        sample_size: Number of samples to evaluate
+    """
+    logger.info(f"Running HotpotQA {variant} benchmark with {sample_size} samples...")
+    
+    try:
+        # Load HotpotQA dataset
+        ds = load_dataset("hotpotqa/hotpot_qa", variant)
+        
+        # Determine which split to use
+        available_splits = list(ds.keys())
+        logger.info(f"Available splits: {available_splits}")
+        
+        if 'validation' in available_splits:
+            dataset = ds['validation']
+        elif 'train' in available_splits:
+            dataset = ds['train']
+        else:
+            dataset = ds[available_splits[0]]
+        
+        # Take sample
+        if sample_size < len(dataset):
+            dataset = dataset.select(range(sample_size))
+        
+        logger.info(f"Using {len(dataset)} samples from HotpotQA {variant}")
+        
+        hotpot_results = []
+        
+        for i, item in enumerate(dataset):
+            try:
+                # Extract HotpotQA fields
+                question = item.get('question', '')
+                answer = item.get('answer', '')
+                context = item.get('context', [])
+                supporting_facts = item.get('supporting_facts', [])
+                level = item.get('level', 'unknown')
+                type_question = item.get('type', 'unknown')
+                
+                # Build context from supporting paragraphs
+                context_text = ""
+                if context:
+                    context_paragraphs = []
+                    for title, sentences in context:
+                        if sentences:  # Only use non-empty paragraphs
+                            paragraph_text = f"{title}: {' '.join(sentences)}"
+                            context_paragraphs.append(paragraph_text)
+                    
+                    if context_paragraphs:
+                        context_text = "\n".join(context_paragraphs[:5])  # Use first 5 paragraphs
+                
+                # Generate Self-RAG response
+                if context_text.strip():
+                    prompt = model.format_prompt(question, context_text)
+                else:
+                    prompt = model.format_prompt(question)
+                
+                start_time = time.time()
+                pred = model.model.generate([prompt], model.sampling_params)[0]
+                inference_time = time.time() - start_time
+                
+                response_text = pred.outputs[0].text
+                
+                # HotpotQA evaluation - exact match with answer
+                exact_match = answer.lower().strip() in response_text.lower() if answer else False
+                
+                hotpot_results.append({
+                    'variant': variant,
+                    'question': question,
+                    'context': context_text,
+                    'response': response_text,
+                    'ground_truth': answer,
+                    'supporting_facts': supporting_facts,
+                    'level': level,
+                    'type': type_question,
+                    'exact_match': exact_match,
+                    'inference_time': inference_time,
+                    'tokens_generated': len(pred.outputs[0].token_ids),
+                    'is_relevant': '[Relevant]' in response_text,
+                    'is_supported': '[Fully supported]' in response_text or '[Partially supported]' in response_text,
+                    'utility_score': model.extract_utility_score(response_text),
+                    'num_context_paragraphs': len(context) if context else 0
+                })
+                
+                if (i + 1) % 10 == 0:
+                    logger.info(f"Processed {i + 1}/{len(dataset)} HotpotQA {variant} samples")
+                    
+            except Exception as e:
+                logger.error(f"Error processing HotpotQA item {i}: {e}")
+                continue
+        
+        if hotpot_results:
+            avg_em = np.mean([r['exact_match'] for r in hotpot_results])
+            avg_utility = np.mean([r['utility_score'] for r in hotpot_results])
+            relevance_rate = np.mean([r['is_relevant'] for r in hotpot_results])
+            support_rate = np.mean([r['is_supported'] for r in hotpot_results])
+            
+            logger.info(f"HotpotQA {variant} benchmark completed:")
+            logger.info(f"  Exact Match: {avg_em:.3f}")
+            logger.info(f"  Average Utility: {avg_utility:.3f}")
+            logger.info(f"  Relevance Rate: {relevance_rate:.3f}")
+            logger.info(f"  Support Rate: {support_rate:.3f}")
+        
+        return hotpot_results
+        
+    except Exception as e:
+        logger.error(f"Error running HotpotQA {variant}: {e}")
+        logger.info("Please ensure you have access to the dataset. You may need: huggingface-cli login")
+        return []
+
+def run_all_hotpot_variants(model, sample_size: int = 100):
+    """Run both HotpotQA variants"""
+    all_results = {}
+    
+    variants = ["distractor", "fullwiki"]
+    
+    for variant in variants:
+        logger.info(f"Running HotpotQA {variant}...")
+        results = run_hotpot_qa_benchmark(model, variant, sample_size)
+        if results:
+            all_results[f"hotpot_{variant}"] = results
+        else:
+            logger.warning(f"No results obtained for HotpotQA {variant}")
+    
+    return all_results
+
 def main():
     """Main function to run Self-RAG benchmarks"""
     print("Initializing Self-RAG Model...")
@@ -463,9 +731,13 @@ def main():
     print("3. RAGBench - CUAD") 
     print("4. RAGBench - DelucionQA")
     print("5. All RAGBench datasets")
-    print("6. Skip additional benchmarks")
+    print("6. Natural Questions")
+    print("7. HotpotQA - Distractor")
+    print("8. HotpotQA - FullWiki")
+    print("9. All HotpotQA variants")
+    print("10. Skip additional benchmarks")
     
-    choice = input("Select additional benchmark (1-6, default 6): ").strip() or "6"
+    choice = input("Select additional benchmark (1-10, default 10): ").strip() or "10"
     
     additional_results = {}
     
@@ -484,6 +756,18 @@ def main():
     elif choice == "5":
         sample_size = int(input("RAGBench sample size per dataset (default 100): ") or "100")
         additional_results['ragbench_all'] = run_all_ragbench_datasets(model, sample_size)
+    elif choice == "6":
+        sample_size = int(input("Natural Questions sample size (default 100): ") or "100")
+        additional_results['natural_questions'] = run_natural_questions_benchmark(model, sample_size)
+    elif choice == "7":
+        sample_size = int(input("HotpotQA Distractor sample size (default 100): ") or "100")
+        additional_results['hotpot_distractor'] = run_hotpot_qa_benchmark(model, "distractor", sample_size)
+    elif choice == "8":
+        sample_size = int(input("HotpotQA FullWiki sample size (default 100): ") or "100")
+        additional_results['hotpot_fullwiki'] = run_hotpot_qa_benchmark(model, "fullwiki", sample_size)
+    elif choice == "9":
+        sample_size = int(input("HotpotQA sample size per variant (default 100): ") or "100")
+        additional_results['hotpot_all'] = run_all_hotpot_variants(model, sample_size)
     
     # Combine all results
     all_results = {
