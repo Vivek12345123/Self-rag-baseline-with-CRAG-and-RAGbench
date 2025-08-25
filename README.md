@@ -1,7 +1,5 @@
 # Self-RAG Evaluation Suite
 
-Exact replication of the Self-RAG paper evaluation benchmarks for NeurIPS-level research comparison.
-
 ## 🎯 Overview
 
 This repository contains the complete evaluation framework used in the [Self-RAG paper](https://arxiv.org/abs/2310.11511) by Asai et al. (ICLR 2024). It evaluates the Self-RAG model across 6 key benchmarks with exact replication of the original methodology.
