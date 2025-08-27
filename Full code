@@ -770,7 +770,7 @@ def main():
         return
     
     # Configuration - matching paper evaluation setup
-    sample_size = 12000  # Adjust based on your needs and compute
+    sample_size = 10000  # Adjust based on your needs and compute
     results = {}
     
     # Define the 6 benchmarks exactly as used in Self-RAG paper
