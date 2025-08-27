@@ -157,7 +157,7 @@ class SelfRAGEvaluator:
 # Initialize global evaluator
 evaluator = SelfRAGEvaluator()
 
-def run_natural_questions_benchmark(model, sample_size: int = 100):
+def run_natural_questions_benchmark(model, sample_size: int = 10000):
     """
     Natural Questions - following Self-RAG paper evaluation
     """
@@ -249,7 +249,7 @@ def run_natural_questions_benchmark(model, sample_size: int = 100):
         logger.error(f"Error running Natural Questions: {e}")
         return []
 
-def run_trivia_qa_benchmark(model, sample_size: int = 100):
+def run_trivia_qa_benchmark(model, sample_size: int = 10000):
     """
     TriviaQA - following Self-RAG paper evaluation
     """
@@ -339,7 +339,7 @@ def run_trivia_qa_benchmark(model, sample_size: int = 100):
         logger.error(f"Error running TriviaQA: {e}")
         return []
 
-def run_hotpot_qa_benchmark(model, sample_size: int = 100):
+def run_hotpot_qa_benchmark(model, sample_size: int = 10000):
     """
     HotpotQA - following Self-RAG paper evaluation
     """
@@ -426,7 +426,7 @@ def run_hotpot_qa_benchmark(model, sample_size: int = 100):
         logger.error(f"Error running HotpotQA: {e}")
         return []
 
-def run_squad_v2_benchmark(model, sample_size: int = 100):
+def run_squad_v2_benchmark(model, sample_size: int = 10000):
     """
     SQuAD v2 - following Self-RAG paper evaluation
     """
@@ -507,7 +507,7 @@ def run_squad_v2_benchmark(model, sample_size: int = 100):
         logger.error(f"Error running SQuAD v2: {e}")
         return []
 
-def run_crag_benchmark(model, sample_size: int = 100):
+def run_crag_benchmark(model, sample_size: int = 10000):
     """
     CRAG (Comprehensive RAG Benchmark) - following Self-RAG paper evaluation
     """
@@ -607,7 +607,7 @@ def run_crag_benchmark(model, sample_size: int = 100):
         logger.error(f"Error running CRAG benchmark: {e}")
         return []
 
-def run_ragbench_benchmark(model, sample_size: int = 100):
+def run_ragbench_benchmark(model, sample_size: int = 10000):
     """
     RAGBench - following Self-RAG paper evaluation
     Note: This is a synthetic implementation as RAGBench may not be directly available
