@@ -148,10 +148,10 @@ def run_natural_questions_benchmark(model, sample_size: int = 200, streaming=Fal
     logger.info(f"Running NQ-Open with sample_size={sample_size} (streaming={streaming})")
     try:
         if streaming:
-            ds_iter = load_dataset_retry("nq_open", split="validation", streaming=True)
+            ds_iter = load_dataset_retry("google-research-datasets/natural_questions", "default", split="validation", streaming=True)
             ds = list(itertools.islice(ds_iter, sample_size))
         else:
-            ds = load_dataset_retry("nq_open", split="validation", download_config=DC)
+            ds = load_dataset_retry("google-research-datasets/natural_questions", "default", split="validation", download_config=DC)
             if sample_size < len(ds):
                 ds = ds.select(range(sample_size))
 
@@ -188,10 +188,10 @@ def run_trivia_qa_benchmark(model, sample_size: int = 200, streaming=False):
     logger.info(f"Running TriviaQA(rc) sample_size={sample_size} (streaming={streaming})")
     try:
         if streaming:
-            ds_iter = load_dataset_retry("trivia_qa", "rc", split="validation", streaming=True)
+            ds_iter = load_dataset_retry("mandarjoshi/trivia_qa", "rc", split="validation", streaming=True)
             ds = list(itertools.islice(ds_iter, sample_size))
         else:
-            ds = load_dataset_retry("trivia_qa","rc", split="validation", download_config=DC)
+            ds = load_dataset_retry("mandarjoshi/trivia_qa", "rc", split="validation", download_config=DC)
             if sample_size < len(ds): ds = ds.select(range(sample_size))
 
         results=[]
@@ -229,10 +229,10 @@ def run_hotpot_qa_benchmark(model, sample_size: int = 200, streaming=False):
     logger.info(f"Running HotpotQA(distractor) sample_size={sample_size} (streaming={streaming})")
     try:
         if streaming:
-            ds_iter = load_dataset_retry("hotpot_qa", "distractor", split="validation", streaming=True)
+            ds_iter = load_dataset_retry("hotpotqa/hotpot_qa", "distractor", split="validation", streaming=True)
             ds = list(itertools.islice(ds_iter, sample_size))
         else:
-            ds = load_dataset_retry("hotpot_qa","distractor", split="validation", download_config=DC)
+            ds = load_dataset_retry("hotpotqa/hotpot_qa","distractor", split="validation", download_config=DC)
             if sample_size < len(ds): ds = ds.select(range(sample_size))
 
         results=[]
@@ -319,82 +319,98 @@ def run_squad_v2_benchmark(model, sample_size: int = 200, streaming=False):
         logger.error(f"Error running SQuAD v2: {e}", exc_info=True)
         return []
 
-def run_crag_benchmark(model, sample_size: int = 200, streaming=False):
+def run_fever_benchmark(model, sample_size: int = 200, streaming: bool = False):
     """
-    CRAG loader hardened for the removal of `trust_remote_code`.
-    If load still fails, we skip and log a clear message.
+    FEVER (Fact Extraction and VERification) benchmark.
+    Uses HF 'fever' dataset and treats the task as classification:
+    labels are one of {'SUPPORTS', 'REFUTES', 'NOT ENOUGH INFO'}.
+
+    We build a prompt from the claim (instruction) and optional evidence as a 'paragraph'.
+    Scoring is a simple string match (EM/F1) between model output and the gold label.
     """
-    logger.info(f"Running CRAG sample_size={sample_size} (streaming={streaming})")
+    logger.info(f"Running FEVER sample_size={sample_size} (streaming={streaming})")
     try:
-        # 1) Try without trust_remote_code
-        try:
-            if streaming:
-                ds_iter = load_dataset_retry("facebook/crag", split="dev", streaming=True, download_config=DC)
-                ds = list(itertools.islice(ds_iter, sample_size))
-            else:
-                ds = load_dataset_retry("facebook/crag", split="dev", download_config=DC)
-                if sample_size < len(ds):
-                    ds = ds.select(range(sample_size))
-        except Exception as e1:
-            logger.warning(
-                "CRAG load failed without trust_remote_code (as required by HF): %s. "
-                "Skipping CRAG. To silence this, leave SR_USE_CRAG unset or 0.",
-                e1
-            )
-            return []
-
-        results = []
-        for i, item in enumerate(ds):
-            try:
-                query = item.get("query", "")
-                answer = item.get("answer", "") or ""
-                alt_ans = [a for a in (item.get("alt_ans") or []) if a]
-
-                # search_results schema can vary; be defensive
-                search_results = item.get("search_results") or item.get("search", []) or []
-                contexts = []
-                for sr in search_results[:5]:
-                    if isinstance(sr, dict):
-                        snippet = (sr.get("page_snippet") or sr.get("snippet") or "").strip()
-                        name = (sr.get("page_name") or sr.get("title") or "").strip()
-                        if snippet:
-                            contexts.append(f"{name}: {snippet}" if name else snippet)
-                    elif isinstance(sr, str) and sr.strip():
-                        contexts.append(sr.strip())
-                context = "\n".join(contexts) if contexts else None
-
-                prompt = model.format_prompt(query, context)
-                t0 = time.time()
-                resp, tok = safe_generate(model, prompt)
-                dt = time.time() - t0
-
-                gts = [a for a in [answer, *alt_ans] if a]
-                scores = evaluator.evaluate_multiple_answers(resp, gts) if gts else {'em': 0.0, 'f1': 0.0}
-
-                results.append({
-                    'dataset': 'crag', 'query': query, 'response': resp,
-                    'ground_truth': answer, 'alt_answers': alt_ans,
-                    'exact_match': scores['em'], 'f1_score': scores['f1'],
-                    'inference_time': dt, 'tokens_generated': tok,
-                    'utility_score': model.extract_utility_score(resp),
-                    'is_relevant': model.extract_relevance(resp),
-                    'support_level': model.extract_support(resp),
-                    'uses_retrieval': model.uses_retrieval(resp),
-                    'num_search_results': len(search_results)
-                })
-                if (i + 1) % 10 == 0:
-                    logger.info(f"CRAG processed {i+1}/{len(ds) if not streaming else sample_size}")
-            except Exception as e:
-                logger.error(f"CRAG item {i} error: {e}", exc_info=True)
-
-        logger.info(f"CRAG completed with {len(results)} samples")
-        return results
-
+        # Load dataset with retries
+        if streaming:
+            ds_iter = load_dataset_retry("fever/fever", "v2.0", split="validation", streaming=True, download_config=DC)
+            ds = list(itertools.islice(ds_iter, sample_size))
+        else:
+            ds = load_dataset_retry("fever/fever", "v2.0", split="validation", download_config=DC)
+            if sample_size < len(ds):
+                ds = ds.select(range(sample_size))
     except Exception as e:
-        logger.error("Error running CRAG (post trust_remote_code removal): %s", e, exc_info=True)
+        logger.error(f"Failed to load FEVER: {e}", exc_info=True)
         return []
+
+    def _extract_fever_context(evidence):
+        """
+        FEVER 'evidence' can vary by loader; collect up to a few textual snippets if present.
+        Accepts strings, dicts with 'text'/'evidence_text', or nested lists of those.
+        """
+        texts = []
+
+        def collect(x):
+            if isinstance(x, str) and x.strip():
+                texts.append(x.strip())
+            elif isinstance(x, dict):
+                t = (x.get("text") or x.get("evidence_text") or "").strip()
+                if t:
+                    texts.append(t)
+            elif isinstance(x, (list, tuple)):
+                for y in x:
+                    collect(y)
+
+        collect(evidence)
+        return "\n".join(texts[:5]) if texts else ""
+
+    results = []
+    for i, item in enumerate(ds):
+        try:
+            claim = item.get("claim", "") or ""
+            label = item.get("label", "") or ""   # 'SUPPORTS', 'REFUTES', 'NOT ENOUGH INFO'
+            evidence = item.get("evidence", None)
+
+            context_text = _extract_fever_context(evidence) if evidence is not None else ""
+            paragraph = context_text if context_text.strip() else None
+
+            # Build prompt using your SelfRAG-style formatter (instruction + optional retrieval paragraph)
+            prompt = model.format_prompt(claim, paragraph)
+
+            t0 = time.time()
+            resp, tok = safe_generate(model, prompt)
+            dt = time.time() - t0
+
+            # Evaluate: compare model text vs. gold label (simple EM/F1 over strings)
+            golds = [label] if label else []
+            scores = evaluator.evaluate_multiple_answers(resp, golds) if golds else {'em': 0.0, 'f1': 0.0}
+
+            results.append({
+                'dataset': 'fever',
+                'claim': claim,
+                'response': resp,
+                'label': label,
+                'exact_match': scores['em'],
+                'f1_score': scores['f1'],
+                'inference_time': dt,
+                'tokens_generated': tok,
+                'utility_score': model.extract_utility_score(resp),
+                'is_relevant': model.extract_relevance(resp),
+                'support_level': model.extract_support(resp),
+                'uses_retrieval': model.uses_retrieval(resp),
+                'has_context': bool(paragraph)
+            })
+
+            if (i + 1) % 10 == 0:
+                logger.info(f"FEVER processed {i + 1}/{len(ds) if not streaming else sample_size}")
+
+        except Exception as e:
+            logger.error(f"FEVER item {i} error: {e}", exc_info=True)
+
+    logger.info(f"FEVER completed with {len(results)} samples")
+    return results
+
     
-def run_ragbench_benchmark(model, sample_size: int = 200, streaming=False):
+def run_ms_marco_benchmark(model, sample_size: int = 200, streaming=False):
     """
     Proxy with MS MARCO v2.1 validation; robust passage handling.
     """
@@ -402,10 +418,10 @@ def run_ragbench_benchmark(model, sample_size: int = 200, streaming=False):
     try:
         try:
             if streaming:
-                ds_iter = load_dataset_retry("ms_marco", "v2.1", split="validation", streaming=True)
+                ds_iter = load_dataset_retry("microsoft/ms_marco", "v2.1", split="validation", streaming=True)
                 ds = list(itertools.islice(ds_iter, sample_size))
             else:
-                ds = load_dataset_retry("ms_marco","v2.1", split="validation", download_config=DC)
+                ds = load_dataset_retry("microsoft/ms_marco","v2.1", split="validation", download_config=DC)
                 if sample_size < len(ds): ds = ds.select(range(sample_size))
         except Exception as e:
             logger.warning(f"MS MARCO not available: {e}")
@@ -437,20 +453,20 @@ def run_ragbench_benchmark(model, sample_size: int = 200, streaming=False):
                 scores = evaluator.evaluate_multiple_answers(resp, answer_texts) if answer_texts else {'em':0.0,'f1':0.0}
 
                 results.append({
-                    'dataset':'ragbench','query':query,'response':resp,
+                    'dataset':'msmarco','query':query,'response':resp,
                     'ground_truth_answers':answer_texts,'exact_match':scores['em'],'f1_score':scores['f1'],
                     'inference_time':dt,'tokens_generated':tok,
                     'utility_score':model.extract_utility_score(resp),'is_relevant':model.extract_relevance(resp),
                     'support_level':model.extract_support(resp),'uses_retrieval':model.uses_retrieval(resp),
                     'num_passages': len(passages.get("passage_text", [])) if isinstance(passages, dict) else 0
                 })
-                if (i+1)%10==0: logger.info(f"RAGBench processed {i+1}/{len(ds) if not streaming else sample_size}")
+                if (i+1)%10==0: logger.info(f"MSMarco processed {i+1}/{len(ds) if not streaming else sample_size}")
             except Exception as e:
-                logger.error(f"RAGBench item {i} error: {e}", exc_info=True)
-        logger.info(f"RAGBench proxy completed with {len(results)} samples")
+                logger.error(f"MSMarco item {i} error: {e}", exc_info=True)
+        logger.info(f"MSMarco proxy completed with {len(results)} samples")
         return results
     except Exception as e:
-        logger.error(f"Error running RAGBench proxy: {e}", exc_info=True)
+        logger.error(f"Error running MSMarco proxy: {e}", exc_info=True)
         return []
 
 # ----------------------- Aggregation & I/O -----------------------
@@ -511,8 +527,8 @@ def main():
         ("TriviaQA", run_trivia_qa_benchmark),
         ("HotpotQA", run_hotpot_qa_benchmark),
         ("SQuAD v2", run_squad_v2_benchmark),
-        ("CRAG", run_crag_benchmark),
-        ("RAGBench", run_ragbench_benchmark),
+        ("FEVER", run_fever_benchmark),
+        ("MSMarco", run_ms_marco_benchmark),
     ]
 
     logger.info(f"Running {len(benchmarks)} benchmarks; sample_size={sample_size}; streaming={streaming}")
