@@ -563,6 +563,331 @@ def run_fever_rag_benchmark(model, sample_size: int = 200, streaming: bool = Fal
     logger.info(f"FEVER (RAG) completed with {len(results)} samples")
     return results
 
+def run_ragtruth_rag_benchmark(model, sample_size: int = 200, streaming: bool = False, split: Optional[str] = None):
+    """
+    RAGTruth (wandb/RAGTruth-processed) with actual retrieval.
+    - Builds a global TF-IDF index over evidence/contexts found in the dataset.
+    - Retrieves top-k snippets per query and injects them into the [Retrieval] paragraph.
+    - If a gold answer/reference string exists, evaluates EM/F1; otherwise EM/F1=0 by design.
+    """
+    ds_id = "wandb/RAGTruth-processed"
+    # Try sensible split fallbacks if the caller didn't specify one
+    split_candidates = [split] if split else ["validation", "val", "dev", "test"]
+    ds = None
+    err_last = None
+
+    logger.info(f"Running RAGTruth (RAG) sample_size={sample_size} (streaming={streaming})")
+
+    # -------- dataset load with fallback over splits --------
+    for sp in split_candidates:
+        if sp is None:
+            continue
+        try:
+            if streaming:
+                ds_iter = load_dataset_retry(ds_id, split=sp, streaming=True, download_config=DC)
+                ds = list(itertools.islice(ds_iter, sample_size))
+            else:
+                ds = load_dataset_retry(ds_id, split=sp, download_config=DC)
+                if sample_size < len(ds):
+                    ds = ds.select(range(sample_size))
+            logger.info(f"Loaded {ds_id} split='{sp}' with {len(ds)} rows")
+            break
+        except Exception as e:
+            err_last = e
+            logger.warning(f"Load failed for split '{sp}': {e}")
+
+    if ds is None:
+        logger.error(f"Failed to load {ds_id} on splits {split_candidates}: {err_last}", exc_info=True)
+        return []
+
+    # -------- helpers to be robust to schema variations --------
+    TEXT_KEYS_QUERY = ["claim", "question", "query", "prompt", "instruction", "input", "task"]
+    TEXT_KEYS_GOLD  = ["answer", "answers", "reference", "reference_answer",
+                       "ground_truth", "ground_truth_answer", "target", "output", "label"]
+    # Evidence/context style fields we can index
+    EVIDENCE_KEYS   = ["evidence", "evidences", "evidence_text", "evidence_texts",
+                       "contexts", "context", "passages", "documents", "docs",
+                       "supporting_facts", "references"]
+
+    def first_nonempty(item, keys):
+        for k in keys:
+            if k in item and item[k] is not None:
+                v = item[k]
+                if isinstance(v, str) and v.strip():
+                    return v.strip()
+                # prefer single string if list
+                if isinstance(v, list):
+                    for vv in v:
+                        if isinstance(vv, str) and vv.strip():
+                            return vv.strip()
+                # sometimes nested dict has 'text'
+                if isinstance(v, dict):
+                    t = v.get("text") or v.get("value")
+                    if isinstance(t, str) and t.strip():
+                        return t.strip()
+        return ""
+
+    def collect_texts(obj):
+        """Collect textual snippets from strings / dicts / lists recursively."""
+        acc = []
+        def rec(x):
+            if x is None: return
+            if isinstance(x, str):
+                s = x.strip()
+                if s: acc.append(s)
+            elif isinstance(x, dict):
+                # common text-ish keys
+                for key in ("text", "snippet", "passage", "content", "sentence", "evidence_text", "value"):
+                    val = x.get(key)
+                    if isinstance(val, str) and val.strip():
+                        acc.append(val.strip())
+                # also crawl nested
+                for vv in x.values():
+                    rec(vv)
+            elif isinstance(x, (list, tuple)):
+                for y in x: rec(y)
+        rec(obj)
+        return acc
+
+    # -------- build a global retrieval corpus --------
+    corpus = []
+    for item in ds:
+        for key in EVIDENCE_KEYS:
+            if key in item and item[key] is not None:
+                corpus.extend(collect_texts(item[key]))
+
+    # fallback: if we found nothing, also pull any long "context" from the record
+    if not corpus:
+        for item in ds:
+            corpus.extend(collect_texts(item))
+
+    # dedupe + cap size for memory
+    corpus = [c for c in corpus if isinstance(c, str) and c.strip()]
+    corpus = list(dict.fromkeys(corpus))
+    corpus_cap = int(os.environ.get("SR_CORPUS_CAP", "50000"))
+    if len(corpus) > corpus_cap:
+        corpus = corpus[:corpus_cap]
+
+    if not corpus:
+        logger.warning("RAGTruth: No textual evidence/contexts discovered; retrieval will be a no-op.")
+        retriever = None
+    else:
+        logger.info(f"RAGTruth: Building TF-IDF index on {len(corpus)} snippets...")
+        retriever = MiniTfidfRetriever(corpus)
+
+    top_k = int(os.environ.get("SR_RETRIEVE_K", "3"))
+    results = []
+
+    # -------- evaluation loop --------
+    for i, item in enumerate(ds):
+        try:
+            query = first_nonempty(item, TEXT_KEYS_QUERY)
+            # gold answer/reference if any (some RAGTruth variants are hallucination labels only)
+            golds = []
+            gold_candidate = first_nonempty(item, TEXT_KEYS_GOLD)
+            if gold_candidate:
+                # if the field is a list of golds:
+                if isinstance(item.get("answers"), list):
+                    golds = [g for g in item["answers"] if isinstance(g, str) and g.strip()]
+                else:
+                    golds = [gold_candidate]
+
+            # retrieve
+            paragraph = None
+            if retriever and query:
+                hits = retriever.search(query, k=top_k)
+                if hits:
+                    snips = [corpus[idx] for idx, _ in hits]
+                    paragraph = join_snippets(snips)
+
+            # prompt + generate
+            prompt = model.format_prompt(query or "", paragraph)
+            t0 = time.time(); resp, tok = safe_generate(model, prompt); dt = time.time() - t0
+
+            # score (only if we have textual golds)
+            scores = evaluator.evaluate_multiple_answers(resp, golds) if golds else {'em': 0.0, 'f1': 0.0}
+
+            results.append({
+                'dataset': 'ragtruth',
+                'query': query,
+                'response': resp,
+                'ground_truth_answers': golds,
+                'exact_match': scores['em'],
+                'f1_score': scores['f1'],
+                'inference_time': dt,
+                'tokens_generated': tok,
+                'utility_score': model.extract_utility_score(resp),
+                'is_relevant': model.extract_relevance(resp),
+                'support_level': model.extract_support(resp),
+                'uses_retrieval': bool(paragraph),
+                'retrieved_k': top_k if paragraph else 0
+            })
+
+            if (i + 1) % 10 == 0:
+                logger.info(f"RAGTruth (RAG) processed {i+1}/{len(ds) if not streaming else sample_size}")
+
+        except Exception as e:
+            logger.error(f"RAGTruth item {i} error: {e}", exc_info=True)
+
+    logger.info(f"RAGTruth (RAG) completed with {len(results)} samples")
+    return results
+
+def run_msmarco_rag_benchmark(
+    model,
+    sample_size: int = 200,
+    streaming: bool = False,
+    config: str = "v2.1",
+    split: str = "validation"
+):
+    """
+    MS MARCO (RAG):
+    - Build a global TF-IDF corpus from dataset passages.
+    - Retrieve top-k snippets per query and supply as [Retrieval] paragraph.
+    - Score EM/F1 vs answers + wellFormedAnswers (when provided).
+    """
+    ds_id = "microsoft/ms_marco"
+    logger.info(f"Running MS MARCO (RAG) {ds_id}:{config} split={split} sample_size={sample_size} (streaming={streaming})")
+
+    # -------- Load dataset --------
+    try:
+        if streaming:
+            ds_iter = load_dataset_retry(ds_id, config, split=split, streaming=True, download_config=DC)
+            ds = list(itertools.islice(ds_iter, sample_size))
+        else:
+            ds = load_dataset_retry(ds_id, config, split=split, download_config=DC)
+            if sample_size < len(ds):
+                ds = ds.select(range(sample_size))
+    except Exception as e:
+        logger.error(f"Error loading {ds_id}:{config} {split}: {e}", exc_info=True)
+        return []
+
+    # -------- Helpers to extract passages robustly --------
+    def collect_passage_texts(passages_field):
+        """
+        Normalize various MS MARCO passage representations to a flat list of strings.
+        Common forms:
+          - dict with key 'passage_text': list[str]
+          - list[dict] with keys like 'passage_text' / 'text' / 'passage'
+          - list[str]
+        """
+        out = []
+        if passages_field is None:
+            return out
+
+        if isinstance(passages_field, dict):
+            # typical: {'passage_text': [...], ...}
+            for key in ("passage_text", "text", "passage", "snippet"):
+                vals = passages_field.get(key)
+                if isinstance(vals, list):
+                    out.extend([v.strip() for v in vals if isinstance(v, str) and v.strip()])
+                elif isinstance(vals, str) and vals.strip():
+                    out.append(vals.strip())
+
+        elif isinstance(passages_field, list):
+            for elt in passages_field:
+                if isinstance(elt, str) and elt.strip():
+                    out.append(elt.strip())
+                elif isinstance(elt, dict):
+                    for key in ("passage_text", "text", "passage", "snippet", "content"):
+                        v = elt.get(key)
+                        if isinstance(v, str) and v.strip():
+                            out.append(v.strip())
+        else:
+            # single string?
+            if isinstance(passages_field, str) and passages_field.strip():
+                out.append(passages_field.strip())
+
+        return out
+
+    # -------- Build global corpus --------
+    corpus = []
+    for item in ds:
+        p = item.get("passages")
+        corpus.extend(collect_passage_texts(p))
+
+        # Occasionally ms_marco variants expose 'contexts' or 'documents'
+        if not p:
+            for alt_key in ("contexts", "documents", "context"):
+                if alt_key in item and item[alt_key] is not None:
+                    corpus.extend(collect_passage_texts(item[alt_key]))
+
+    # Deduplicate + cap
+    corpus = [c for c in corpus if isinstance(c, str) and c.strip()]
+    corpus = list(dict.fromkeys(corpus))
+    corpus_cap = int(os.environ.get("SR_CORPUS_CAP", "50000"))
+    if len(corpus) > corpus_cap:
+        corpus = corpus[:corpus_cap]
+
+    if not corpus:
+        logger.warning("MS MARCO: No passages found to build corpus; retrieval will be a no-op.")
+        retriever = None
+    else:
+        logger.info(f"MS MARCO: Building TF-IDF index on {len(corpus)} snippets...")
+        retriever = MiniTfidfRetriever(corpus)
+
+    top_k = int(os.environ.get("SR_RETRIEVE_K", "3"))
+    results = []
+
+    # -------- Evaluation loop --------
+    for i, item in enumerate(ds):
+        try:
+            query = (item.get("query") or "").strip()
+
+            # Gold answers
+            answers = item.get("answers") or []
+            wf = item.get("wellFormedAnswers") or []
+            gts = []
+            if isinstance(answers, list):
+                gts.extend([a for a in answers if isinstance(a, str) and a.strip()])
+            elif isinstance(answers, str) and answers.strip():
+                gts.append(answers.strip())
+            if isinstance(wf, list):
+                gts.extend([a for a in wf if isinstance(a, str) and a.strip()])
+            elif isinstance(wf, str) and wf.strip():
+                gts.append(wf.strip())
+
+            # Retrieve
+            paragraph = None
+            if retriever and query:
+                hits = retriever.search(query, k=top_k)
+                if hits:
+                    snips = [corpus[idx] for idx, _ in hits]
+                    paragraph = join_snippets(snips)
+
+            # Prompt + generate
+            prompt = model.format_prompt(query, paragraph)
+            t0 = time.time(); resp, tok = safe_generate(model, prompt); dt = time.time() - t0
+
+            # Score
+            scores = evaluator.evaluate_multiple_answers(resp, gts) if gts else {'em': 0.0, 'f1': 0.0}
+
+            results.append({
+                'dataset': 'msmarco',
+                'query': query,
+                'response': resp,
+                'ground_truth_answers': gts,
+                'exact_match': scores['em'],
+                'f1_score': scores['f1'],
+                'inference_time': dt,
+                'tokens_generated': tok,
+                'utility_score': model.extract_utility_score(resp),
+                'is_relevant': model.extract_relevance(resp),
+                'support_level': model.extract_support(resp),
+                'uses_retrieval': bool(paragraph),
+                'retrieved_k': top_k if paragraph else 0
+            })
+
+            if (i + 1) % 10 == 0:
+                logger.info(f"MS MARCO (RAG) processed {i+1}/{len(ds) if not streaming else sample_size}")
+
+        except Exception as e:
+            logger.error(f"MS MARCO item {i} error: {e}", exc_info=True)
+
+    logger.info(f"MS MARCO (RAG) completed with {len(results)} samples")
+    return results
+
+
+
 # ============== Aggregation & I/O ======================
 def compute_aggregate_metrics(results):
     if not results: return {}
@@ -619,7 +944,8 @@ def main():
         ("HotpotQA (RAG)",          run_hotpot_qa_rag_benchmark),
         ("SQuAD v2 (RAG)",          run_squad_v2_rag_benchmark),
         ("FEVER (RAG)",             run_fever_rag_benchmark),
-        # You can add MS MARCO RAG similarly by building a corpus from passages.
+        ("RAGTruth (RAG)",          run_ragtruth_rag_benchmark),
+        ("MS MARCO (RAG)",          run_msmarco_rag_benchmark),
     ]
 
     logger.info(f"Running {len(benchmarks)} benchmarks; sample_size={sample_size}; streaming={streaming}")
