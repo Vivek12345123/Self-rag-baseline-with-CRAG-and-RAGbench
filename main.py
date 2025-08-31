@@ -1,22 +1,23 @@
 from vllm import LLM, SamplingParams
-import json, time, os, sys, logging, re, string
+import json, time, os, sys, logging, re, string, itertools, random, atexit, datetime
 from typing import List, Dict, Any, Optional
 from collections import Counter
 import numpy as np
-from datasets import load_dataset
-from datasets.utils.file_utils import DownloadConfig
-import time, random
-from datasets import load_dataset
-import itertools
-import atexit, datetime
 import torch.distributed as dist
 
+from datasets import load_dataset
+from datasets.utils.file_utils import DownloadConfig
 
+# ======================= Logging =======================
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger("selfrag_eval")
+
+# =================== Download Config ===================
+# (Use only supported args for your datasets version)
+DC = DownloadConfig(max_retries=5)
+
+# =================== Retry Wrapper =====================
 def load_dataset_retry(*args, retries=5, base_sleep=2.0, jitter=0.75, **kwargs):
-    """
-    Retry wrapper for HF load_dataset with exponential backoff + jitter.
-    Works with both normal and streaming modes.
-    """
     for attempt in range(1, retries + 1):
         try:
             return load_dataset(*args, **kwargs)
@@ -25,12 +26,11 @@ def load_dataset_retry(*args, retries=5, base_sleep=2.0, jitter=0.75, **kwargs):
                 raise
             sleep = (base_sleep ** (attempt - 1)) + random.uniform(0.0, jitter)
             logger.warning(
-                f"load_dataset failed (attempt {attempt}/{retries}): {e}. "
-                f"Retrying in {sleep:.1f}s"
+                f"load_dataset failed (attempt {attempt}/{retries}): {e}. Retrying in {sleep:.1f}s"
             )
             time.sleep(sleep)
 
-# Optional metrics
+# =================== Optional Metrics ==================
 try:
     from rouge_score import rouge_scorer
     ROUGE_AVAILABLE = True
@@ -45,30 +45,20 @@ except Exception:
     print("Warning: bert_score not available. pip install bert_score")
     BERTSCORE_AVAILABLE = False
 
-# Logging
-logging.basicConfig(level=logging.INFO,
-                    format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger("selfrag_eval")
-
-# Global download config (helps with transient 50x like your 504)
-DC = DownloadConfig(max_retries=5)
-
-# ----------------------- Model & Evaluator -----------------------
-
+# ====================== Model ==========================
 class SelfRAGModel:
-    def __init__(self,
-                 model_path: str = "selfrag/selfrag_llama2_7b",
+    def __init__(self, model_path: str = "selfrag/selfrag_llama2_7b",
                  download_dir: str = "/gscratch/h2lab/akari/model_cache",
                  dtype: str = "half"):
         self.model = LLM(model_path, download_dir=download_dir, dtype=dtype)
         self.sampling_params = SamplingParams(
-            temperature=0.0, top_p=1.0, max_tokens=100, skip_special_tokens=False
+            temperature=0.0, top_p=1.0, max_tokens=200, skip_special_tokens=False
         )
 
     def format_prompt(self, input_text, paragraph=None):
         prompt = f"### Instruction:\n{input_text}\n\n### Response:\n"
         if paragraph:
-            prompt += f"[Retrieval]<paragraph>{paragraph}</paragraph>"
+            prompt += f"[Retrieval]<paragraph>{paragraph}</paragraph>\n"
         return prompt
 
     def extract_utility_score(self, text: str) -> int:
@@ -81,17 +71,16 @@ class SelfRAGModel:
         return "[Relevant]" in text
 
     def extract_support(self, text: str) -> str:
-        if "[Fully supported]" in text:
-            return "fully_supported"
-        if "[Partially supported]" in text:
-            return "partially_supported"
-        if "[No support / Contradictory]" in text:
-            return "no_support"
+        if "[Fully supported]" in text: return "fully_supported"
+        if "[Partially supported]" in text: return "partially_supported"
+        if "[No support / Contradictory]" in text: return "no_support"
         return "unknown"
 
     def uses_retrieval(self, text: str) -> bool:
+        # NOTE: we will also track retrieval via our own boolean when we *supply* context
         return "[Retrieve]" in text
 
+# ==================== Evaluator ========================
 class SelfRAGEvaluator:
     def __init__(self):
         self.rouge_scorer = (
@@ -103,7 +92,7 @@ class SelfRAGEvaluator:
         def remove_articles(t): return re.sub(r"\b(a|an|the)\b", " ", t, flags=re.I)
         def white_space_fix(t): return " ".join(t.split())
         def remove_punc(t): return "".join(ch for ch in t if ch not in set(string.punctuation))
-        return white_space_fix(remove_articles(remove_punc(s.lower())))
+        return white_space_fix(remove_articles(remove_punc((s or "").lower())))
 
     def exact_match_score(self, pred, gt) -> float:
         return float(self.normalize_answer(pred) == self.normalize_answer(gt))
@@ -124,14 +113,14 @@ class SelfRAGEvaluator:
         if not ground_truths: return {'em': 0.0, 'f1': 0.0}
         best_em = 0.0; best_f1 = 0.0
         for gt in ground_truths:
-            if not (gt and gt.strip()): continue
+            if not (gt and str(gt).strip()): continue
             best_em = max(best_em, self.exact_match_score(prediction, gt))
             best_f1 = max(best_f1, self.f1_score(prediction, gt))
         return {'em': best_em, 'f1': best_f1}
 
 evaluator = SelfRAGEvaluator()
 
-# Safe generation wrapper
+# ================== Safe Generation ====================
 def safe_generate(model: SelfRAGModel, prompt: str):
     out = model.model.generate([prompt], model.sampling_params)[0]
     if not getattr(out, "outputs", None):
@@ -139,338 +128,442 @@ def safe_generate(model: SelfRAGModel, prompt: str):
     first = out.outputs[0]
     return (first.text or ""), len(first.token_ids or [])
 
-# ----------------------- Benchmarks -----------------------
+# ============== Tiny TF-IDF Retriever ==================
+class MiniTfidfRetriever:
+    """
+    Minimal TF-IDF + cosine retriever (no external deps).
+    Build on a list of strings. Tokenizer = lowercase, \w+.
+    """
+    def __init__(self, docs: List[str]):
+        self.docs = docs
+        self.N = len(docs)
+        self.token_re = re.compile(r"\w+")
+        # build vocabulary and idf
+        df = Counter()
+        self.doc_tokens = []
+        for text in docs:
+            toks = self._tokenize(text)
+            self.doc_tokens.append(toks)
+            df.update(set(toks))
+        self.idf = {t: (np.log((1 + self.N) / (1 + c)) + 1.0) for t, c in df.items()}
+        # doc vectors
+        self.doc_vecs = []
+        self.doc_norms = []
+        for toks in self.doc_tokens:
+            tf = Counter(toks)
+            vec = {t: (tf[t] * self.idf.get(t, 0.0)) for t in tf}
+            norm = np.sqrt(sum(v*v for v in vec.values())) or 1.0
+            self.doc_vecs.append(vec)
+            self.doc_norms.append(norm)
 
-def run_natural_questions_benchmark(model, sample_size: int = 200, streaming=False):
+    def _tokenize(self, text: str) -> List[str]:
+        if not text:
+            return []
+        return [m.group(0).lower() for m in self.token_re.finditer(text)]
+
+    def _vec(self, text: str):
+        toks = self._tokenize(text)
+        tf = Counter(toks)
+        vec = {t: (tf[t] * self.idf.get(t, 0.0)) for t in tf}
+        norm = np.sqrt(sum(v*v for v in vec.values())) or 1.0
+        return vec, norm
+
+    def search(self, query: str, k: int = 3) -> List[tuple[int, float]]:
+        qv, qn = self._vec(query or "")
+        if not qv:
+            return []
+        scores = []
+        for i, dv in enumerate(self.doc_vecs):
+            # dot product over smaller dict
+            if len(qv) < len(dv):
+                dot = sum(w * dv.get(t, 0.0) for t, w in qv.items())
+            else:
+                dot = sum(w * qv.get(t, 0.0) for t, w in dv.items())
+            sim = dot / (self.doc_norms[i] * qn)
+            scores.append((i, sim))
+        scores.sort(key=lambda x: x[1], reverse=True)
+        return scores[:k]
+
+# ================= Helper utils ========================
+_SENT_SPLIT = re.compile(r'(?<=[.!?])\s+')
+
+def split_sentences(text: str) -> List[str]:
+    if not text: return []
+    parts = _SENT_SPLIT.split(text.strip())
+    # keep non-empty short-ish sentences
+    return [p.strip() for p in parts if p and len(p.strip()) > 0]
+
+def cap_list(xs: List[str], cap: int) -> List[str]:
+    if cap and len(xs) > cap:
+        return xs[:cap]
+    return xs
+
+def join_snippets(snips: List[str], max_chars: int = 1500) -> str:
+    out, total = [], 0
+    for s in snips:
+        s2 = s.strip()
+        if not s2: continue
+        if total + len(s2) + 1 > max_chars: break
+        out.append(s2); total += len(s2) + 1
+    return "\n".join(out)
+
+# ===================== Benchmarks ======================
+
+def run_nq_rag_benchmark(model, sample_size: int = 200, streaming=False):
     """
-    Use nq_open (stable schema): {'question': str, 'answers': list[str]}
+    Natural Questions (google-research-datasets/natural_questions default).
+    Build a global corpus from any available 'document' tokens when present,
+    otherwise fall back to no retrieval for those items.
     """
-    logger.info(f"Running NQ-Open with sample_size={sample_size} (streaming={streaming})")
+    logger.info(f"Running NQ (RAG) sample_size={sample_size} (streaming={streaming})")
     try:
         if streaming:
-            ds_iter = load_dataset_retry("google-research-datasets/natural_questions", "default", split="validation", streaming=True)
+            ds_iter = load_dataset_retry("google-research-datasets/natural_questions", "default",
+                                         split="validation", streaming=True)
             ds = list(itertools.islice(ds_iter, sample_size))
         else:
-            ds = load_dataset_retry("google-research-datasets/natural_questions", "default", split="validation", download_config=DC)
+            ds = load_dataset_retry("google-research-datasets/natural_questions", "default",
+                                    split="validation", download_config=DC)
             if sample_size < len(ds):
                 ds = ds.select(range(sample_size))
-
-        results = []
-        for i, item in enumerate(ds):
-            try:
-                question = item.get("question", "")
-                answer_texts = [a for a in (item.get("answers") or []) if a]
-                prompt = model.format_prompt(question)  # no built-in context
-                t0 = time.time()
-                resp, tok_count = safe_generate(model, prompt)
-                dt = time.time() - t0
-                scores = evaluator.evaluate_multiple_answers(resp, answer_texts) if answer_texts else {'em':0.0,'f1':0.0}
-                results.append({
-                    'dataset':'nq_open','question':question,'response':resp,
-                    'ground_truth_answers':answer_texts,'exact_match':scores['em'],'f1_score':scores['f1'],
-                    'inference_time':dt,'tokens_generated':tok_count,
-                    'utility_score':model.extract_utility_score(resp),'is_relevant':model.extract_relevance(resp),
-                    'support_level':model.extract_support(resp),'uses_retrieval':model.uses_retrieval(resp)
-                })
-                if (i+1)%10==0: logger.info(f"NQ processed {i+1}/{len(ds) if not streaming else sample_size}")
-            except Exception as e:
-                logger.error(f"NQ item {i} error: {e}", exc_info=True)
-        logger.info(f"NQ-Open completed with {len(results)} samples")
-        return results
     except Exception as e:
-        logger.error(f"Error running NQ-Open: {e}", exc_info=True)
+        logger.error(f"Error loading NQ: {e}", exc_info=True)
         return []
 
-def run_trivia_qa_benchmark(model, sample_size: int = 200, streaming=False):
+    # Build corpus from document tokens where available
+    corpus = []
+    for item in ds:
+        document = item.get("document") or {}
+        tokens = document.get("tokens") or []
+        if tokens and isinstance(tokens, list):
+            text = " ".join([t.get("token","") if isinstance(t, dict) else str(t) for t in tokens[:800]])
+            if text.strip():
+                corpus.append(text.strip())
+    corpus_cap = int(os.environ.get("SR_CORPUS_CAP", "50000"))
+    corpus = cap_list(list(dict.fromkeys(corpus)), corpus_cap)
+
+    retriever = MiniTfidfRetriever(corpus) if corpus else None
+    top_k = int(os.environ.get("SR_RETRIEVE_K", "3"))
+
+    results = []
+    for i, item in enumerate(ds):
+        try:
+            q = item.get("question", "")
+            if isinstance(q, dict):
+                question = q.get("text", "") or ""
+            else:
+                question = q or ""
+
+            # ground truths (if present in this config)
+            gts = item.get("answers") or []
+            gts = [a for a in gts if a]
+
+            paragraph = None
+            if retriever and question:
+                hits = retriever.search(question, k=top_k)
+                if hits:
+                    snips = [corpus[idx] for idx, _ in hits]
+                    paragraph = join_snippets(snips)
+
+            prompt = model.format_prompt(question, paragraph)
+            t0 = time.time()
+            resp, tok = safe_generate(model, prompt)
+            dt = time.time() - t0
+
+            scores = evaluator.evaluate_multiple_answers(resp, gts) if gts else {'em':0.0,'f1':0.0}
+
+            results.append({
+                'dataset':'nq','question':question,'response':resp,
+                'ground_truth_answers':gts,'exact_match':scores['em'],'f1_score':scores['f1'],
+                'inference_time':dt,'tokens_generated':tok,
+                'utility_score':model.extract_utility_score(resp),
+                'is_relevant':model.extract_relevance(resp),
+                'support_level':model.extract_support(resp),
+                'uses_retrieval': bool(paragraph),
+                'retrieved_k': top_k if paragraph else 0
+            })
+            if (i+1)%10==0: logger.info(f"NQ (RAG) processed {i+1}/{len(ds)}")
+        except Exception as e:
+            logger.error(f"NQ item {i} error: {e}", exc_info=True)
+
+    logger.info(f"NQ (RAG) completed with {len(results)} samples")
+    return results
+
+
+def run_trivia_qa_rag_benchmark(model, sample_size: int = 200, streaming=False):
     """
-    TriviaQA rc: {'question': str, 'context': str, 'answer': {'value', 'aliases'}}
+    TriviaQA (rc): build a global corpus from 'context' strings and retrieve for each question.
     """
-    logger.info(f"Running TriviaQA(rc) sample_size={sample_size} (streaming={streaming})")
+    logger.info(f"Running TriviaQA(rc) (RAG) sample_size={sample_size} (streaming={streaming})")
     try:
         if streaming:
             ds_iter = load_dataset_retry("mandarjoshi/trivia_qa", "rc", split="validation", streaming=True)
             ds = list(itertools.islice(ds_iter, sample_size))
         else:
             ds = load_dataset_retry("mandarjoshi/trivia_qa", "rc", split="validation", download_config=DC)
-            if sample_size < len(ds): ds = ds.select(range(sample_size))
-
-        results=[]
-        for i,item in enumerate(ds):
-            try:
-                question = item.get("question","")
-                context_text = item.get("context","") or ""
-                ans = item.get("answer", {}) or {}
-                answer_texts = []
-                if ans.get("value"): answer_texts.append(ans["value"])
-                answer_texts += [a for a in (ans.get("aliases") or []) if a]
-
-                prompt = model.format_prompt(question, context_text if context_text.strip() else None)
-                t0=time.time(); resp, tok = safe_generate(model, prompt); dt=time.time()-t0
-                scores = evaluator.evaluate_multiple_answers(resp, answer_texts) if answer_texts else {'em':0.0,'f1':0.0}
-
-                results.append({
-                    'dataset':'trivia_qa','question':question,'response':resp,
-                    'ground_truth_answers':answer_texts,'exact_match':scores['em'],'f1_score':scores['f1'],
-                    'inference_time':dt,'tokens_generated':tok,
-                    'utility_score':model.extract_utility_score(resp),'is_relevant':model.extract_relevance(resp),
-                    'support_level':model.extract_support(resp),'uses_retrieval':model.uses_retrieval(resp),
-                    'has_context': bool(context_text)
-                })
-                if (i+1)%10==0: logger.info(f"TriviaQA processed {i+1}/{len(ds) if not streaming else sample_size}")
-            except Exception as e:
-                logger.error(f"TriviaQA item {i} error: {e}", exc_info=True)
-        logger.info(f"TriviaQA completed with {len(results)} samples")
-        return results
+            if sample_size < len(ds):
+                ds = ds.select(range(sample_size))
     except Exception as e:
-        logger.error(f"Error running TriviaQA: {e}", exc_info=True)
+        logger.error(f"Error loading TriviaQA: {e}", exc_info=True)
         return []
 
-def run_hotpot_qa_benchmark(model, sample_size: int = 200, streaming=False):
-    logger.info(f"Running HotpotQA(distractor) sample_size={sample_size} (streaming={streaming})")
+    # Build global corpus
+    contexts = [ (item.get("context") or "").strip() for item in ds ]
+    contexts = [c for c in contexts if c]
+    corpus_cap = int(os.environ.get("SR_CORPUS_CAP", "50000"))
+    corpus = cap_list(list(dict.fromkeys(contexts)), corpus_cap)
+    retriever = MiniTfidfRetriever(corpus) if corpus else None
+    top_k = int(os.environ.get("SR_RETRIEVE_K", "3"))
+
+    results = []
+    for i, item in enumerate(ds):
+        try:
+            question = (item.get("question") or "").strip()
+            ans = item.get("answer", {}) or {}
+            gts = []
+            if ans.get("value"): gts.append(ans["value"])
+            gts += [a for a in (ans.get("aliases") or []) if a]
+
+            paragraph = None
+            if retriever and question:
+                hits = retriever.search(question, k=top_k)
+                if hits:
+                    snips = [corpus[idx] for idx, _ in hits]
+                    paragraph = join_snippets(snips)
+
+            prompt = model.format_prompt(question, paragraph)
+            t0 = time.time(); resp, tok = safe_generate(model, prompt); dt = time.time()-t0
+            scores = evaluator.evaluate_multiple_answers(resp, gts) if gts else {'em':0.0,'f1':0.0}
+
+            results.append({
+                'dataset':'trivia_qa','question':question,'response':resp,
+                'ground_truth_answers':gts,'exact_match':scores['em'],'f1_score':scores['f1'],
+                'inference_time':dt,'tokens_generated':tok,
+                'utility_score':model.extract_utility_score(resp),
+                'is_relevant':model.extract_relevance(resp),
+                'support_level':model.extract_support(resp),
+                'uses_retrieval': bool(paragraph),
+                'retrieved_k': top_k if paragraph else 0
+            })
+            if (i+1)%10==0: logger.info(f"TriviaQA (RAG) processed {i+1}/{len(ds)}")
+        except Exception as e:
+            logger.error(f"TriviaQA item {i} error: {e}", exc_info=True)
+
+    logger.info(f"TriviaQA (RAG) completed with {len(results)} samples")
+    return results
+
+
+def run_hotpot_qa_rag_benchmark(model, sample_size: int = 200, streaming=False):
+    """
+    HotpotQA distractor: build a global corpus of paragraphs (title: sentences...) and retrieve.
+    """
+    logger.info(f"Running HotpotQA(distractor) (RAG) sample_size={sample_size} (streaming={streaming})")
     try:
         if streaming:
             ds_iter = load_dataset_retry("hotpotqa/hotpot_qa", "distractor", split="validation", streaming=True)
             ds = list(itertools.islice(ds_iter, sample_size))
         else:
-            ds = load_dataset_retry("hotpotqa/hotpot_qa","distractor", split="validation", download_config=DC)
-            if sample_size < len(ds): ds = ds.select(range(sample_size))
-
-        results=[]
-        for i,item in enumerate(ds):
-            try:
-                question = item.get("question","")
-                answer = item.get("answer","") or ""
-                level = item.get("level","unknown")
-                qtype = item.get("type","unknown")
-
-                # context: list of [title, [sentences...]]
-                context_texts=[]
-                for pair in item.get("context", []):
-                    if isinstance(pair,(list,tuple)) and len(pair)==2:
-                        title, sentences = pair
-                        if sentences:
-                            context_texts.append(f"{title}: {' '.join(sentences)}")
-                context_text = "\n".join(context_texts[:5])
-
-                prompt = model.format_prompt(question, context_text if context_text.strip() else None)
-                t0=time.time(); resp, tok = safe_generate(model, prompt); dt=time.time()-t0
-                scores = evaluator.evaluate_multiple_answers(resp, [answer]) if answer else {'em':0.0,'f1':0.0}
-
-                results.append({
-                    'dataset':'hotpot_qa','question':question,'response':resp,'ground_truth_answer':answer,
-                    'level':level,'type':qtype,'exact_match':scores['em'],'f1_score':scores['f1'],
-                    'inference_time':dt,'tokens_generated':tok,
-                    'utility_score':model.extract_utility_score(resp),'is_relevant':model.extract_relevance(resp),
-                    'support_level':model.extract_support(resp),'uses_retrieval':model.uses_retrieval(resp),
-                    'num_context_paragraphs': len(context_texts)
-                })
-                if (i+1)%10==0: logger.info(f"HotpotQA processed {i+1}/{len(ds) if not streaming else sample_size}")
-            except Exception as e:
-                logger.error(f"HotpotQA item {i} error: {e}", exc_info=True)
-        logger.info(f"HotpotQA completed with {len(results)} samples")
-        return results
+            ds = load_dataset_retry("hotpotqa/hotpot_qa", "distractor", split="validation", download_config=DC)
+            if sample_size < len(ds):
+                ds = ds.select(range(sample_size))
     except Exception as e:
-        logger.error(f"Error running HotpotQA: {e}", exc_info=True)
+        logger.error(f"Error loading HotpotQA: {e}", exc_info=True)
         return []
 
-def run_squad_v2_benchmark(model, sample_size: int = 200, streaming=False):
-    logger.info(f"Running SQuAD v2 sample_size={sample_size} (streaming={streaming})")
+    # Build corpus of paragraphs (title + sentences)
+    paragraphs = []
+    for item in ds:
+        for pair in item.get("context", []):
+            if isinstance(pair,(list,tuple)) and len(pair)==2:
+                title, sentences = pair
+                if sentences:
+                    paragraphs.append(f"{title}: {' '.join(sentences)}")
+    paragraphs = [p.strip() for p in paragraphs if p and p.strip()]
+    corpus_cap = int(os.environ.get("SR_CORPUS_CAP", "50000"))
+    corpus = cap_list(list(dict.fromkeys(paragraphs)), corpus_cap)
+    retriever = MiniTfidfRetriever(corpus) if corpus else None
+    top_k = int(os.environ.get("SR_RETRIEVE_K", "3"))
+
+    results=[]
+    for i, item in enumerate(ds):
+        try:
+            question = (item.get("question") or "").strip()
+            gold = (item.get("answer") or "").strip()
+
+            paragraph = None
+            if retriever and question:
+                hits = retriever.search(question, k=top_k)
+                if hits:
+                    snips = [corpus[idx] for idx, _ in hits]
+                    paragraph = join_snippets(snips)
+
+            prompt = model.format_prompt(question, paragraph)
+            t0 = time.time(); resp, tok = safe_generate(model, prompt); dt = time.time()-t0
+            scores = evaluator.evaluate_multiple_answers(resp, [gold]) if gold else {'em':0.0,'f1':0.0}
+
+            results.append({
+                'dataset':'hotpot_qa','question':question,'response':resp,'ground_truth_answer':gold,
+                'exact_match':scores['em'],'f1_score':scores['f1'],
+                'inference_time':dt,'tokens_generated':tok,
+                'utility_score':model.extract_utility_score(resp),
+                'is_relevant':model.extract_relevance(resp),
+                'support_level':model.extract_support(resp),
+                'uses_retrieval': bool(paragraph),
+                'retrieved_k': top_k if paragraph else 0
+            })
+            if (i+1)%10==0: logger.info(f"HotpotQA (RAG) processed {i+1}/{len(ds)}")
+        except Exception as e:
+            logger.error(f"Hotpot item {i} error: {e}", exc_info=True)
+
+    logger.info(f"HotpotQA (RAG) completed with {len(results)} samples")
+    return results
+
+
+def run_squad_v2_rag_benchmark(model, sample_size: int = 200, streaming=False):
+    """
+    SQuAD v2: per-item retrieval over that item's context sentences (selective grounding).
+    """
+    logger.info(f"Running SQuAD v2 (RAG) sample_size={sample_size} (streaming={streaming})")
     try:
         if streaming:
             ds_iter = load_dataset_retry("rajpurkar/squad_v2", split="validation", streaming=True)
             ds = list(itertools.islice(ds_iter, sample_size))
         else:
             ds = load_dataset_retry("rajpurkar/squad_v2", split="validation", download_config=DC)
-            if sample_size < len(ds): ds = ds.select(range(sample_size))
-
-        results=[]
-        for i,item in enumerate(ds):
-            try:
-                question = item.get("question","")
-                context = item.get("context","") or ""
-                answers = item.get("answers", {}) or {}
-                answer_texts = [a for a in (answers.get("text") or []) if a]
-                is_impossible = (len(answer_texts)==0)
-
-                prompt = model.format_prompt(question, context if context.strip() else None)
-                t0=time.time(); resp, tok = safe_generate(model, prompt); dt=time.time()-t0
-
-                if not is_impossible and answer_texts:
-                    scores = evaluator.evaluate_multiple_answers(resp, answer_texts)
-                else:
-                    no_ans = ["no answer","cannot answer","not provided","unknown","unanswerable"]
-                    detected = any(ind in (resp.lower() if resp else "") for ind in no_ans)
-                    scores = {'em': 1.0 if detected else 0.0, 'f1': 1.0 if detected else 0.0}
-
-                results.append({
-                    'dataset':'squad_v2','question':question,'response':resp,
-                    'ground_truth_answers':answer_texts,'is_impossible':is_impossible,
-                    'exact_match':scores['em'],'f1_score':scores['f1'],
-                    'inference_time':dt,'tokens_generated':tok,
-                    'utility_score':model.extract_utility_score(resp),'is_relevant':model.extract_relevance(resp),
-                    'support_level':model.extract_support(resp),'uses_retrieval':model.uses_retrieval(resp)
-                })
-                if (i+1)%10==0: logger.info(f"SQuAD v2 processed {i+1}/{len(ds) if not streaming else sample_size}")
-            except Exception as e:
-                logger.error(f"SQuAD v2 item {i} error: {e}", exc_info=True)
-        logger.info(f"SQuAD v2 completed with {len(results)} samples")
-        return results
+            if sample_size < len(ds):
+                ds = ds.select(range(sample_size))
     except Exception as e:
-        logger.error(f"Error running SQuAD v2: {e}", exc_info=True)
+        logger.error(f"Error loading SQuAD v2: {e}", exc_info=True)
         return []
 
-def run_fever_benchmark(model, sample_size: int = 200, streaming: bool = False):
-    """
-    FEVER (Fact Extraction and VERification) benchmark.
-    Uses HF 'fever' dataset and treats the task as classification:
-    labels are one of {'SUPPORTS', 'REFUTES', 'NOT ENOUGH INFO'}.
+    top_k = int(os.environ.get("SR_RETRIEVE_K", "3"))
 
-    We build a prompt from the claim (instruction) and optional evidence as a 'paragraph'.
-    Scoring is a simple string match (EM/F1) between model output and the gold label.
+    results=[]
+    for i, item in enumerate(ds):
+        try:
+            question = (item.get("question") or "").strip()
+            context = (item.get("context") or "").strip()
+            answers = item.get("answers", {}) or {}
+            gts = [a for a in (answers.get("text") or []) if a]
+            is_impossible = (len(gts) == 0)
+
+            paragraph = None
+            if context and question:
+                # per-item retriever over sentences of this context
+                sents = split_sentences(context)
+                if sents:
+                    retr = MiniTfidfRetriever(sents)
+                    hits = retr.search(question, k=top_k)
+                    if hits:
+                        snips = [sents[idx] for idx, _ in hits]
+                        paragraph = join_snippets(snips)
+
+            prompt = model.format_prompt(question, paragraph if paragraph else context)
+            t0 = time.time(); resp, tok = safe_generate(model, prompt); dt = time.time()-t0
+
+            if not is_impossible and gts:
+                scores = evaluator.evaluate_multiple_answers(resp, gts)
+            else:
+                # simple impossible detection
+                no_ans = ["no answer","cannot answer","not provided","unknown","unanswerable"]
+                detected = any(ind in (resp.lower() if resp else "") for ind in no_ans)
+                scores = {'em': 1.0 if detected else 0.0, 'f1': 1.0 if detected else 0.0}
+
+            results.append({
+                'dataset':'squad_v2','question':question,'response':resp,
+                'ground_truth_answers':gts,'is_impossible':is_impossible,
+                'exact_match':scores['em'],'f1_score':scores['f1'],
+                'inference_time':dt,'tokens_generated':tok,
+                'utility_score':model.extract_utility_score(resp),
+                'is_relevant':model.extract_relevance(resp),
+                'support_level':model.extract_support(resp),
+                'uses_retrieval': bool(paragraph),
+                'retrieved_k': top_k if paragraph else 0
+            })
+            if (i+1)%10==0: logger.info(f"SQuAD v2 (RAG) processed {i+1}/{len(ds)}")
+        except Exception as e:
+            logger.error(f"SQuAD item {i} error: {e}", exc_info=True)
+
+    logger.info(f"SQuAD v2 (RAG) completed with {len(results)} samples")
+    return results
+
+
+def run_fever_rag_benchmark(model, sample_size: int = 200, streaming: bool = False):
     """
-    logger.info(f"Running FEVER sample_size={sample_size} (streaming={streaming})")
+    FEVER with actual retrieval: build a global corpus from available evidence texts.
+    NOTE: using a HF mirror that *includes* textual evidence. Adjust if your mirror changes.
+    """
+    logger.info(f"Running FEVER (RAG) sample_size={sample_size} (streaming={streaming})")
     try:
-        # Load dataset with retries
         if streaming:
-            ds_iter = load_dataset_retry("fever/fever", "v2.0", split="validation", streaming=True, download_config=DC)
+            ds_iter = load_dataset_retry("mwong/fever-evidence-related", split="valid", streaming=True, download_config=DC)
             ds = list(itertools.islice(ds_iter, sample_size))
         else:
-            ds = load_dataset_retry("fever/fever", "v2.0", split="validation", download_config=DC)
+            ds = load_dataset_retry("mwong/fever-evidence-related", split="valid", download_config=DC)
             if sample_size < len(ds):
                 ds = ds.select(range(sample_size))
     except Exception as e:
         logger.error(f"Failed to load FEVER: {e}", exc_info=True)
         return []
 
-    def _extract_fever_context(evidence):
-        """
-        FEVER 'evidence' can vary by loader; collect up to a few textual snippets if present.
-        Accepts strings, dicts with 'text'/'evidence_text', or nested lists of those.
-        """
+    def collect_texts(evidence):
         texts = []
-
         def collect(x):
             if isinstance(x, str) and x.strip():
                 texts.append(x.strip())
             elif isinstance(x, dict):
                 t = (x.get("text") or x.get("evidence_text") or "").strip()
-                if t:
-                    texts.append(t)
+                if t: texts.append(t)
             elif isinstance(x, (list, tuple)):
                 for y in x:
                     collect(y)
-
         collect(evidence)
-        return "\n".join(texts[:5]) if texts else ""
+        return texts
+
+    corpus = []
+    for item in ds:
+        corpus.extend(collect_texts(item.get("evidence")))
+    corpus_cap = int(os.environ.get("SR_CORPUS_CAP", "50000"))
+    corpus = cap_list(list(dict.fromkeys([c for c in corpus if c])), corpus_cap)
+    retriever = MiniTfidfRetriever(corpus) if corpus else None
+    top_k = int(os.environ.get("SR_RETRIEVE_K", "3"))
 
     results = []
     for i, item in enumerate(ds):
         try:
-            claim = item.get("claim", "") or ""
-            label = item.get("label", "") or ""   # 'SUPPORTS', 'REFUTES', 'NOT ENOUGH INFO'
-            evidence = item.get("evidence", None)
+            claim = (item.get("claim") or "").strip()
+            label = (item.get("label") or "").strip()
 
-            context_text = _extract_fever_context(evidence) if evidence is not None else ""
-            paragraph = context_text if context_text.strip() else None
+            paragraph = None
+            if retriever and claim:
+                hits = retriever.search(claim, k=top_k)
+                if hits:
+                    snips = [corpus[idx] for idx, _ in hits]
+                    paragraph = join_snippets(snips)
 
-            # Build prompt using your SelfRAG-style formatter (instruction + optional retrieval paragraph)
             prompt = model.format_prompt(claim, paragraph)
+            t0 = time.time(); resp, tok = safe_generate(model, prompt); dt = time.time()-t0
 
-            t0 = time.time()
-            resp, tok = safe_generate(model, prompt)
-            dt = time.time() - t0
-
-            # Evaluate: compare model text vs. gold label (simple EM/F1 over strings)
-            golds = [label] if label else []
-            scores = evaluator.evaluate_multiple_answers(resp, golds) if golds else {'em': 0.0, 'f1': 0.0}
+            scores = evaluator.evaluate_multiple_answers(resp, [label]) if label else {'em':0.0,'f1':0.0}
 
             results.append({
-                'dataset': 'fever',
-                'claim': claim,
-                'response': resp,
-                'label': label,
-                'exact_match': scores['em'],
-                'f1_score': scores['f1'],
-                'inference_time': dt,
-                'tokens_generated': tok,
+                'dataset': 'fever','claim': claim,'response': resp,'label': label,
+                'exact_match': scores['em'],'f1_score': scores['f1'],
+                'inference_time': dt,'tokens_generated': tok,
                 'utility_score': model.extract_utility_score(resp),
                 'is_relevant': model.extract_relevance(resp),
                 'support_level': model.extract_support(resp),
-                'uses_retrieval': model.uses_retrieval(resp),
-                'has_context': bool(paragraph)
+                'uses_retrieval': bool(paragraph),
+                'retrieved_k': top_k if paragraph else 0
             })
-
-            if (i + 1) % 10 == 0:
-                logger.info(f"FEVER processed {i + 1}/{len(ds) if not streaming else sample_size}")
-
+            if (i+1)%10==0: logger.info(f"FEVER (RAG) processed {i+1}/{len(ds)}")
         except Exception as e:
             logger.error(f"FEVER item {i} error: {e}", exc_info=True)
 
-    logger.info(f"FEVER completed with {len(results)} samples")
+    logger.info(f"FEVER (RAG) completed with {len(results)} samples")
     return results
 
-    
-def run_ms_marco_benchmark(model, sample_size: int = 200, streaming=False):
-    """
-    Proxy with MS MARCO v2.1 validation; robust passage handling.
-    """
-    logger.info(f"Running RAGBench proxy (MS MARCO) sample_size={sample_size} (streaming={streaming})")
-    try:
-        try:
-            if streaming:
-                ds_iter = load_dataset_retry("microsoft/ms_marco", "v2.1", split="validation", streaming=True)
-                ds = list(itertools.islice(ds_iter, sample_size))
-            else:
-                ds = load_dataset_retry("microsoft/ms_marco","v2.1", split="validation", download_config=DC)
-                if sample_size < len(ds): ds = ds.select(range(sample_size))
-        except Exception as e:
-            logger.warning(f"MS MARCO not available: {e}")
-            return []
-
-        results=[]
-        for i,item in enumerate(ds):
-            try:
-                query = item.get("query","")
-
-                # passages may be dict of lists
-                passages = item.get("passages", {})
-                if isinstance(passages, dict):
-                    texts = passages.get("passage_text", [])
-                    if isinstance(texts, list):
-                        context_text = "\n".join(t for t in texts[:5] if t)
-                    else:
-                        context_text = ""
-                else:
-                    context_text = ""
-
-                # answers
-                answers = [a for a in (item.get("answers") or []) if a]
-                wf = [a for a in (item.get("wellFormedAnswers") or []) if a]
-                answer_texts = answers + wf
-
-                prompt = model.format_prompt(query, context_text if context_text.strip() else None)
-                t0=time.time(); resp, tok = safe_generate(model, prompt); dt=time.time()-t0
-                scores = evaluator.evaluate_multiple_answers(resp, answer_texts) if answer_texts else {'em':0.0,'f1':0.0}
-
-                results.append({
-                    'dataset':'msmarco','query':query,'response':resp,
-                    'ground_truth_answers':answer_texts,'exact_match':scores['em'],'f1_score':scores['f1'],
-                    'inference_time':dt,'tokens_generated':tok,
-                    'utility_score':model.extract_utility_score(resp),'is_relevant':model.extract_relevance(resp),
-                    'support_level':model.extract_support(resp),'uses_retrieval':model.uses_retrieval(resp),
-                    'num_passages': len(passages.get("passage_text", [])) if isinstance(passages, dict) else 0
-                })
-                if (i+1)%10==0: logger.info(f"MSMarco processed {i+1}/{len(ds) if not streaming else sample_size}")
-            except Exception as e:
-                logger.error(f"MSMarco item {i} error: {e}", exc_info=True)
-        logger.info(f"MSMarco proxy completed with {len(results)} samples")
-        return results
-    except Exception as e:
-        logger.error(f"Error running MSMarco proxy: {e}", exc_info=True)
-        return []
-
-# ----------------------- Aggregation & I/O -----------------------
-
+# ============== Aggregation & I/O ======================
 def compute_aggregate_metrics(results):
     if not results: return {}
     metrics = ['exact_match','f1_score','utility_score']
@@ -498,11 +591,10 @@ def save_results_to_json(results, filename):
     except Exception as e:
         logger.error(f"Error saving {filename}: {e}", exc_info=True)
 
-# ----------------------- Main -----------------------
-
+# ========================= Main ========================
 def main():
     print("="*70)
-    print("SELF-RAG EVALUATION (Schema-safe + Retry-hardened)")
+    print("SELF-RAG EVALUATION (RAG-enabled TF-IDF retrieval)")
     print("="*70)
 
     logger.info("Initializing Self-RAG model...")
@@ -517,18 +609,17 @@ def main():
         logger.error(f"❌ Model init failed: {e}", exc_info=True)
         return
 
-    # Smaller default to prove the loop, then scale up after it works
     sample_size = int(os.environ.get("SR_SAMPLE_SIZE", "200"))
     streaming = os.environ.get("SR_STREAMING", "0") == "1"
 
     results={}
     benchmarks = [
-        ("Natural Questions", run_natural_questions_benchmark),
-        ("TriviaQA", run_trivia_qa_benchmark),
-        ("HotpotQA", run_hotpot_qa_benchmark),
-        ("SQuAD v2", run_squad_v2_benchmark),
-        ("FEVER", run_fever_benchmark),
-        ("MSMarco", run_ms_marco_benchmark),
+        ("Natural Questions (RAG)", run_nq_rag_benchmark),
+        ("TriviaQA (RAG)",          run_trivia_qa_rag_benchmark),
+        ("HotpotQA (RAG)",          run_hotpot_qa_rag_benchmark),
+        ("SQuAD v2 (RAG)",          run_squad_v2_rag_benchmark),
+        ("FEVER (RAG)",             run_fever_rag_benchmark),
+        # You can add MS MARCO RAG similarly by building a corpus from passages.
     ]
 
     logger.info(f"Running {len(benchmarks)} benchmarks; sample_size={sample_size}; streaming={streaming}")
@@ -538,7 +629,7 @@ def main():
             t0=time.time()
             bench_results = func(model, sample_size=sample_size, streaming=streaming)
             t1=time.time()
-            key = name.lower().replace(" ","_")
+            key = name.lower().replace(" ","_").replace("(","").replace(")","")
             if bench_results:
                 aggregated = compute_aggregate_metrics(bench_results)
                 results[key] = {
@@ -560,7 +651,7 @@ def main():
             save_results_to_json(results, f"selfrag_results_partial_{int(time.time())}.json")
         except Exception as e:
             logger.error(f"❌ Error running {name}: {e}", exc_info=True)
-            key = name.lower().replace(" ","_")
+            key = name.lower().replace(" ","_").replace("(","").replace(")","")
             results[key] = {
                 'individual_results': [],
                 'aggregated_metrics': {},
@@ -594,15 +685,15 @@ def main():
             print(f"\n❌ {name}: {v.get('status','no-data')}")
 
     print("\n" + "="*80)
-    print(f"📊 OVERALL: {succ}/6 benchmarks produced results; total samples: {total}")
+    print(f"📊 OVERALL: {succ}/{len(benchmarks)} benchmarks produced results; total samples: {total}")
     print(f"🗂  Results saved to: {final}")
     print("="*80)
     return results
 
+# ============== Distributed Cleanup ====================
 def _dist_cleanup():
     try:
         if dist.is_available() and dist.is_initialized():
-            # Optional: try a short barrier so peers don’t race the destroy
             try:
                 dist.barrier(timeout=datetime.timedelta(seconds=5))
             except Exception:
@@ -614,14 +705,14 @@ def _dist_cleanup():
 atexit.register(_dist_cleanup)
 
 def run_all():
-    results = main()
-    return results
+    return main()
 
+# ====================== Entrypoint ======================
 if __name__ == "__main__":
     os.environ.setdefault("TOKENIZERS_PARALLELISM","false")
     os.environ.setdefault("CUDA_VISIBLE_DEVICES","0")
 
-    print("🔥 SELF-RAG EVALUATION SYSTEM (hardened)")
+    print("🔥 SELF-RAG EVALUATION SYSTEM (RAG-enabled)")
     print("="*70)
     print("🔍 Pre-flight checks...")
 
@@ -657,13 +748,4 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\n⏹️  Interrupted")
     finally:
-        # vLLM sometimes exposes a shutdown; call it if present
-        try:
-            from inspect import getattr_static
-            # if you keep a global/model object around, call its shutdown
-            # e.g., if you return the model from main(), store it and do:
-            # if hasattr(model.model, "shutdown"): model.model.shutdown()
-        except Exception:
-            pass
-        # Dist cleanup also runs via atexit, but you can call directly too
         _dist_cleanup()
